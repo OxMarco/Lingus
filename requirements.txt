@@ -1,0 +1,39 @@
+# Dependencies to install and run the live bot (YouTube observe-mode:
+# audio capture -> ASR -> arbiter -> generator -> web tuner UI).
+#
+# Requires Python 3.12  (faster-whisper / ctranslate2 have no wheels for 3.14).
+# Also requires the ffmpeg BINARY on PATH (not a pip package):  brew install ffmpeg
+#
+#   python3.12 -m venv .venv
+#   source .venv/bin/activate
+#   pip install -r requirements.txt        # deps + the lingus package itself
+#
+# Then, with OPENAI_API_KEY set in .env for the hosted generator:
+#   python -m lingus.app --platform youtube --video G43NInZfoPE --web
+#   # open http://127.0.0.1:8080
+#
+# Dev tooling (tests + lint) is not needed to run; install it from pyproject when
+# needed:  pip install -e ".[dev]"
+
+# --- core (config, world-state, persona) ---
+pydantic>=2.13.4
+pydantic-settings>=2.14.2
+pyyaml>=6.0.3
+
+# --- live stream capture (resolves the YouTube live audio URL for ffmpeg) ---
+yt-dlp>=2026.6.9
+
+# --- speech -> text (ASR). Pulls ctranslate2 + numpy as transitive deps. ---
+faster-whisper>=1.2.1
+
+# --- hosted generator over any OpenAI-compatible endpoint (OpenAI / Grok / Claude) ---
+openai>=2.44.0
+
+# --- live web tuner UI sidecar (lingus --web) ---
+aiohttp>=3.14.1
+
+# --- optional: live terminal dashboard (lingus --dashboard). Safe to omit. ---
+rich>=15.0.0
+
+# The lingus package itself (editable). Keeps a single install command.
+-e .

@@ -1,0 +1,15 @@
+venv/
+.venv/
+__pycache__/
+*.pyc
+.env
+.youtube_token.json
+.pytest_cache/
+.ruff_cache/
+*.egg-info/
+dist/
+build/
+recordings/
+
+# Runtime long-term memory store
+.lingus/

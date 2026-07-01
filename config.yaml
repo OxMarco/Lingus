@@ -1,0 +1,132 @@
+# Runtime configuration for the live-stream interaction bot.
+# Secrets (API keys, OAuth client paths) live in .env, not here.
+
+# Which platform adapter to use: "youtube" | "twitch" | "file_replay"
+platform: file_replay
+
+# Offline replay source (used when platform == file_replay).
+file_replay:
+  segment_path: ""        # path to a recorded segment directory (audio + chat jsonl)
+
+youtube:
+  video_id: ""            # live video id to watch
+  # OAuth + Data API config is read from .env
+
+# Model backends (small ones local, generator hosted).
+models:
+  asr:
+    backend: faster_whisper
+    model_size: medium     # tiny|base|small|medium|large-v3 (medium ≈0.48x RTF at 10s window)
+    device: auto           # auto|cpu|metal
+    language: en           # pin language (null = autodetect per window)
+    window_seconds: 10     # ASR window; 10s lets medium/turbo keep up on CPU (+5s latency)
+  llm:
+    # Provider = backend + .env base_url/api_key + the `model` below, together.
+    # `openai_compat` talks to any OpenAI-compatible endpoint. Presets:
+    #   OpenAI : OPENAI_BASE_URL blank          + model gpt-5.5
+    #   Grok   : OPENAI_BASE_URL=api.x.ai/v1     + model grok-...
+    #   Claude : OPENAI_BASE_URL=api.anthropic.com/v1/ + model claude-opus-4-8
+    #            (compatibility shim — see .env.example for caveats)
+    # For full Claude features, set backend: anthropic (native, added later).
+    backend: openai_compat
+    model: gpt-5.5
+    temperature: 0.9
+    max_tokens: 120
+  vlm:
+    backend: none          # enabled in Phase 4
+  moderation:
+    # Safety gate before every post (see lingus/safety.py). "regex" = the
+    # deterministic denylist (hate slurs, threats, CSAE, doxxing, spam);
+    # "none" disables it (offline tuning ONLY — real posting must keep it on).
+    # Jokes, satire, swearing and slang are deliberately allowed.
+    backend: regex
+    check_spam: true       # also catch link-floods / scam CTAs (not slurs)
+    extra_patterns: []     # per-deployment additions to the denylist (raw regexes)
+
+# Persona to load.
+persona:
+  path: src/lingus/persona/personas/default.yaml
+
+# Arbiter: "should I speak?" — these weights and thresholds ARE the temperament.
+# The bar is dynamic: it jumps up by `cooldown_bump` the instant the bot speaks
+# and decays back to `fire_threshold` over ~`cooldown_seconds`, so a strong signal
+# (a direct question) can still break through a cooldown while chatter can't.
+arbiter:
+  fire_threshold: 1.0      # baseline salience the score must clear to speak
+  cooldown_seconds: 20.0   # time-constant for the post-speak bar to decay back
+  cooldown_bump: 1.0       # how much the bar jumps right after speaking
+  lull_after_seconds: 25.0 # silence (with stream still active) before lull builds
+  mood_threshold_gain: 0.3 # more energy (mood) lowers the bar; calm raises it
+  weights:
+    direct_address: 1.5
+    unanswered_question: 1.2
+    streamer_mishap: 1.1
+    chat_hype_spike: 0.8
+    scene_event: 0.7
+    conversational_lull: 0.4
+
+# Chat trends — "everyone's spamming Pog, so the bot pipes up with Pog too".
+# When chat converges on one emote/short phrase, the bot mirrors it verbatim,
+# bypassing the generator (it's a copy, not a "what do I say"). The gate is on
+# DISTINCT senders, not raw volume, so one spammer can't fake a wave.
+# `follow_probability` is temperament: a hype character joins most waves, a
+# deadpan one rarely does.
+chat_trends:
+  enabled: true
+  window_seconds: 12.0     # how far back a wave is counted
+  min_senders: 4           # distinct authors before it counts as a trend (not spam)
+  min_fraction: 0.35       # the line must be this share of all chat in the window
+  max_token_chars: 24      # longer messages are sentences, not pile-ons
+  follow_probability: 0.6  # how often it actually joins a qualifying wave
+  fatigue_seconds: 90.0    # don't echo the same bit again within this long
+  cooldown_seconds: 20.0   # minimum gap between any two trend-follows
+
+# Self-memory dedup + bit-fatigue — kills repetition, the #1 immersion-killer
+# (see lingus/memory/repetition.py). Deterministic gate in the post path.
+memory:
+  similarity_threshold: 0.6  # token-Jaccard overlap with a recent reply = a repeat
+  fatigue_seconds: 180.0     # a catchphrase stays "spent" this long after use
+  episodic_enabled: true
+  episodic_batch_lines: 8    # fold the "stream so far" digest once this many lines age out
+  episodic_max_chars: 800    # cap on the running narrative
+  semantic_enabled: true     # durable facts persisted across streams
+  semantic_path: .lingus/semantic.json
+  semantic_max_facts: 50
+  semantic_top_k: 5          # how many facts surface into the generator's context
+
+# Cold-start channel research — before the loop starts, profile the streamer
+# (yt-dlp channel metadata + live web search, distilled by the LLM) and seed the
+# durable semantic memory, so the bot walks in already knowing the channel. Runs
+# once per channel (cached under cache_dir; re-researched after refresh_days).
+# Force a refresh with `--research`; skip a run with `--no-research`.
+research:
+  enabled: true
+  channel: ""              # non-YouTube platforms: name to research (ignored on YouTube)
+  refresh_days: 14         # re-research a known channel only after this many days (0 = always)
+  max_facts: 12            # cap on facts seeded into memory
+  cache_dir: .lingus/research
+  web_search:
+    backend: duckduckgo    # duckduckgo (keyless, needs [research] extra) | none
+    max_results: 6         # snippets kept per query
+    max_queries: 4         # distinct searches per channel
+
+# Output guardrails — the deterministic last line before a message is posted
+# (see lingus/output_governor.py). These are invariants, not temperament: the
+# arbiter decides *whether* to speak; the governor guarantees the bot can't spam
+# or post overly long messages no matter what the arbiter or generator decide.
+output:
+  max_chars: 200                 # hard length cap; over-long replies are truncated
+                                 # at a sentence (or word) boundary, never mid-word
+  min_seconds_between_posts: 8.0 # hard floor between any two posts
+  posts_per_minute: 6.0          # token-bucket sustained rate
+  burst: 2                       # token-bucket capacity (how many may bunch up)
+  regenerate_on_overflow: true   # try one tighter reply before truncating
+  # Temporizer: emulate human typing time so a sentence can't land instantly.
+  typing_cps: 15.0               # characters "typed" per second
+  typing_base_seconds: 0.4       # reaction beat before typing starts
+  typing_min_seconds: 0.8        # a one-word reaction still feels deliberate
+  typing_max_seconds: 7.0        # cap so a long reply doesn't stall forever
+
+logging:
+  level: INFO
+  json: false

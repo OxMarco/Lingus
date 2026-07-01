@@ -89,9 +89,27 @@ system. The hard problems are about *timing*, not any single perception module:
 
 ### Architecture
 
-```
-VIDEO  AUDIO  CHAT   →  WORLD STATE  →  ARBITER  →  GENERATOR  →  SAFETY  →  CHAT
-(perception)            (blackboard)    (when?)     (what?)       (filter)   (post)
+```mermaid
+flowchart LR
+    subgraph perception[Perception]
+        VIDEO[VIDEO]
+        AUDIO[AUDIO]
+        CHAT_IN[CHAT]
+    end
+    WS[WORLD STATE<br/>blackboard]
+    ARB{ARBITER<br/>when?}
+    GEN[GENERATOR<br/>what?]
+    SAFE[SAFETY<br/>filter]
+    POST[CHAT<br/>post]
+
+    VIDEO --> WS
+    AUDIO --> WS
+    CHAT_IN --> WS
+    WS --> ARB
+    ARB -->|on trigger| GEN
+    GEN --> SAFE
+    SAFE --> POST
+    POST -.->|re-injected| WS
 ```
 
 * **Adapters** (`adapters/`) abstract the platform: file-replay + YouTube (Twitch later).
@@ -172,6 +190,44 @@ python -m lingus.app --segment tests/samples/cake --speed 100
 This sample replays scene + speech context for a chocolate-cake stain and logs the
 bot's reply through the file replay chat adapter.
 
+### Run against a live YouTube stream
+
+Lingus runs in **observe mode** here: it pulls the stream's **audio** (→ ASR) and
+**live chat** (keyless), runs the full arbiter → generator → safety → governor
+pipeline, and **logs the reply it *would* post** — it does not write to chat.
+(Posting needs OAuth and lands with the posting/Twitch adapter; `ObserveChatAdapter`
+is read-only by design.)
+
+1. Install the runtime extras:
+   ```sh
+   pip install -e ".[asr,youtube,llm]"
+   # optional: ".[research]" (channel pre-profiling), ".[dashboard]" / ".[web]" (live tuning UI)
+   ```
+2. Configure the generator (optional — without a key it falls back to a deterministic
+   template, which validates the loop but is not the personality). In `.env`:
+   ```sh
+   OPENAI_API_KEY=sk-...
+   OPENAI_BASE_URL=            # blank for OpenAI; https://api.x.ai/v1 for Grok; etc.
+   ```
+   Match `models.llm.model` in `config.yaml` to your provider. The safety gate
+   (`moderation.backend: regex`) and live-chat ingestion (`youtube.chat_enabled: true`)
+   are on by default — leave them on.
+3. Point it at a **currently-live** stream (URL or video ID):
+   ```sh
+   python -m lingus.app --platform youtube --video "https://www.youtube.com/watch?v=<LIVE_ID>"
+   ```
+
+Useful flags: `--language it|en|auto` (pin ASR language; default `en`),
+`--asr-model small|medium|large-v3` (only `medium` is cached — others re-download),
+`--research` / `--no-research` (force or skip cold-start channel profiling),
+`--dashboard` or `--web --web-port 8080` (live view of world-state, arbiter scores,
+and would-be posts).
+
+> **Caveats.** The stream must be **live** (VODs give no chat continuation); the first
+> run downloads the ASR model unless `medium` is cached; on Apple Silicon ASR runs
+> CPU/int8 (no Metal), which is why `medium`/10s-window is the tuned default; video is
+> not wired yet (Phase 4), so this is audio + chat only.
+
 Run the test suite and linter:
 
 ```sh
@@ -190,12 +246,14 @@ ruff check src tests
 - [x] **Phase 0.5** — context snapshot, simple arbiter, deterministic offline reply loop
 - [ ] **Phase 1** — speech → reply → chat: capture + local ASR + hosted/template generator + governor wired and validated live in observe mode
     - Remaining: validate the real LLM generator live; post path lands with the Twitch adapter
-- [ ] **Phase 2** — chat perception: `ChatTrendDetector` (hype/pile-on) built and wired into the arbiter
-    - Remaining: real YouTube live-chat ingestion (`ObserveChatAdapter.incoming` yields nothing)
+- [x] **Phase 2** — chat perception: `ChatTrendDetector` (hype/pile-on) built and wired into the arbiter; keyless YouTube live-chat ingestion (`YouTubeLiveChatClient`) wired into `ObserveChatAdapter`
 - [x] **Phase 3** — memory: working + self-memory + dedup/bit-fatigue + episodic summarization + semantic (durable cross-stream facts)
 - [ ] **Phase 4** — video: frame gating + VLM scene state — `youtube.py` `video_frames()` is a stub
-- [ ] **Phase 5** — hardening: output moderation pass, staleness/barge-in, per-signal cooldowns
-- [ ] **Phase 6** — eval loop (record / replay / judge)
+- [ ] **Phase 5** — hardening
+    - Done: output moderation pass (`RegexModeration`, authoritative gate in the post path); output governor (rate + length caps)
+    - Remaining: mid-flight staleness/barge-in abort, per-signal cooldowns, guard-model moderation backend
+- [x] **Phase 6** — eval loop: record / replay / judge (`--eval`, heuristic + LLM-as-judge)
+- [x] **Cold-start research** — profile the channel pre-loop and seed durable memory (`research/`, per-channel cache)
 - [ ] **Final** — Twitch adapter
 
 See the [open issues](https://github.com/OxMarco/Lingus/issues) for a full list of

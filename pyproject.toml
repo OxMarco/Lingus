@@ -21,7 +21,7 @@ asr = ["faster-whisper>=1.0"]
 youtube = [
     "yt-dlp>=2024.0",
     "av>=12.0",
-    "pytchat>=0.5",
+    "aiohttp>=3.9",  # keyless live-chat ingestion (InnerTube; see adapters/youtube_chat.py)
     "google-api-python-client>=2.0",
     "google-auth-oauthlib>=1.2",
 ]

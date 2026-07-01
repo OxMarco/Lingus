@@ -37,6 +37,8 @@ class FileReplayConfig(BaseModel):
 
 class YouTubeConfig(BaseModel):
     video_id: str = ""
+    # Read the live chat (keyless InnerTube reader). Off = speech-only observe.
+    chat_enabled: bool = True
 
 
 class ASRConfig(BaseModel):

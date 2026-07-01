@@ -67,8 +67,10 @@ def build_adapters(
         video = video_override or settings.youtube.video_id
         if not video:
             raise SystemExit("youtube platform needs --video or config.youtube.video_id")
-        # Observe mode: a live capture + ASR spine, but replies are logged not posted.
-        return YouTubeCaptureAdapter(video), ObserveChatAdapter(), None
+        # Observe mode: live capture + real chat ingestion (keyless), but replies
+        # are logged not posted — posting needs OAuth and is a later phase.
+        chat_video = video if settings.youtube.chat_enabled else None
+        return YouTubeCaptureAdapter(video), ObserveChatAdapter(chat_video), None
     # Twitch adapter arrives in the final phase.
     raise SystemExit(f"platform '{settings.platform}' not implemented yet")
 

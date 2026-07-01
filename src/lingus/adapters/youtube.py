@@ -5,10 +5,12 @@ piped through ffmpeg into 16 kHz mono PCM — exactly what the ASR backend wants
 and yields it as `AudioChunk`s. Video frames arrive in Phase 4; for now the
 speech spine is the point.
 
-`ObserveChatAdapter` is the output sink for a read-only test: it never reads a
-real chat and never posts to one. `post()` just logs what the bot *would* say,
-so we can watch the bot react to a real stream without writing into a
-third-party chat (which would need OAuth and is poor etiquette besides).
+`ObserveChatAdapter` is the read-only chat side: `incoming()` yields the
+stream's real live chat (keyless InnerTube reader, see youtube_chat.py) so the
+arbiter and trend detector see the actual firehose, while `post()` just logs
+what the bot *would* say — we watch the bot react to a real stream without
+writing into a third-party chat (which would need OAuth and is poor etiquette
+besides).
 """
 
 from __future__ import annotations
@@ -124,18 +126,46 @@ class YouTubeCaptureAdapter(StreamCaptureAdapter):
 
 
 class ObserveChatAdapter(ChatAdapter):
-    """Read-only output sink: logs what the bot would post, never posts."""
+    """Reads the real live chat; logs what the bot would post, never posts."""
+
+    def __init__(self, video: str | None = None) -> None:
+        # No video -> no ingestion (speech-only observe, or youtube.chat_enabled
+        # off). The client is built lazily in start() so constructing the
+        # adapter never needs aiohttp.
+        self._video = video
+        self._client = None
 
     async def start(self) -> None:
-        log.info("observe-mode chat: replies will be logged, not posted")
+        if self._video:
+            try:
+                from .youtube_chat import YouTubeLiveChatClient
+            except ImportError:
+                log.warning(
+                    "live-chat ingestion needs aiohttp (pip install -e '.[youtube]'); "
+                    "running without chat"
+                )
+            else:
+                self._client = YouTubeLiveChatClient(self._video)
+        log.info(
+            "observe-mode chat: reading live chat=%s; replies will be logged, not posted",
+            "on" if self._client is not None else "off",
+        )
 
     async def stop(self) -> None:
         pass
 
     async def incoming(self) -> AsyncIterator[ChatMessage]:
-        # No chat ingestion in observe mode (the test target is a movie stream).
-        return
-        yield  # pragma: no cover  (makes this an async generator)
+        if self._client is None:
+            return
+        try:
+            async for msg in self._client.messages():
+                yield msg
+        except Exception:
+            # Chat is a perception channel, not the spine: if ingestion dies
+            # (chat disabled mid-stream, protocol drift, network gone), log and
+            # carry on speech-only rather than letting the task failure stop
+            # the whole loop.
+            log.exception("live chat ingestion failed; continuing without chat")
 
     async def post(self, text: str) -> None:
         log.info("[BOT would post] %s", text)

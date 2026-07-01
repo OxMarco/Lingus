@@ -10,7 +10,8 @@ file_replay:
 
 youtube:
   video_id: ""            # live video id to watch
-  # OAuth + Data API config is read from .env
+  chat_enabled: true      # read the live chat (keyless); false = speech-only observe
+  # OAuth + Data API config is read from .env (needed only for posting, later)
 
 # Model backends (small ones local, generator hosted).
 models:

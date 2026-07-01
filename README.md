@@ -1,67 +1,269 @@
-# Lingus
+<a id="readme-top"></a>
 
-<p><image alt="lingus logo" src="./logo.png"></p>
+<!-- PROJECT SHIELDS -->
+[![Contributors][contributors-shield]][contributors-url]
+[![Forks][forks-shield]][forks-url]
+[![Stargazers][stars-shield]][stars-url]
+[![Issues][issues-shield]][issues-url]
+[![Python][python-shield]][python-url]
 
----
 
-A real-time, characterful live-stream interaction bot. It perceives a live stream (video + audio + chat), fuses it into a shared world-state, decides *when* to speak (arbiter) and *what* to say (generator) and posts to chat, optimized for **personality** over raw coverage.
 
-## Architecture
+<!-- PROJECT LOGO -->
+<br />
+<div align="center">
+  <a href="https://github.com/OxMarco/Lingus">
+    <img src="logo.png" alt="Lingus logo" width="240">
+  </a>
+
+  <h3 align="center">Lingus</h3>
+
+  <p align="center">
+    A real-time, characterful live-stream interaction bot — perceives a stream (video + audio + chat), decides <em>when</em> to speak and <em>what</em> to say, and posts to chat. Personality over coverage.
+    <br />
+    <a href="./CLAUDE.md"><strong>Explore the design spec »</strong></a>
+    <br />
+    <br />
+    <a href="#usage">View Demo</a>
+    &middot;
+    <a href="https://github.com/OxMarco/Lingus/issues/new?labels=bug">Report Bug</a>
+    &middot;
+    <a href="https://github.com/OxMarco/Lingus/issues/new?labels=enhancement">Request Feature</a>
+  </p>
+</div>
+
+
+
+<!-- TABLE OF CONTENTS -->
+<details>
+  <summary>Table of Contents</summary>
+  <ol>
+    <li>
+      <a href="#about-the-project">About The Project</a>
+      <ul>
+        <li><a href="#architecture">Architecture</a></li>
+        <li><a href="#built-with">Built With</a></li>
+      </ul>
+    </li>
+    <li>
+      <a href="#getting-started">Getting Started</a>
+      <ul>
+        <li><a href="#prerequisites">Prerequisites</a></li>
+        <li><a href="#installation">Installation</a></li>
+      </ul>
+    </li>
+    <li><a href="#usage">Usage</a></li>
+    <li><a href="#roadmap">Roadmap</a></li>
+    <li><a href="#contributing">Contributing</a></li>
+    <li><a href="#license">License</a></li>
+    <li><a href="#contact">Contact</a></li>
+    <li><a href="#acknowledgments">Acknowledgments</a></li>
+  </ol>
+</details>
+
+
+
+<!-- ABOUT THE PROJECT -->
+## About The Project
+
+Lingus watches a live stream through three channels — video, audio, and chat —
+fuses them into a coherent picture of "what's happening right now," and decides when
+it's worth saying something. When it is, it generates a short, in-character message
+and posts it to chat. It remembers the stream so far (and prior streams) so it can
+make callbacks, sustain running jokes, and feel like a familiar presence rather than
+a stateless responder.
+
+It's built as a **perception–cognition loop on a clock**, not a request/response
+system. The hard problems are about *timing*, not any single perception module:
+
+* **Perception** writes to a shared, timestamped world-state; **cognition** reads
+  state, never raw streams.
+* **"Should I speak?"** (a cheap, always-on *arbiter*) is a separate decision from
+  **"What do I say?"** (an expensive *generator* that only runs when the arbiter fires).
+* **Personality** is distributed across three subsystems — arbiter *timing*,
+  generator *voice*, and memory *callbacks* — not just the prompt.
+* Every generated message passes a deterministic **safety filter** and **output
+  governor** (rate + length caps) before it is posted.
+
+<p align="right">(<a href="#readme-top">back to top</a>)</p>
+
+### Architecture
 
 ```
-VIDEO  AUDIO  CHAT   →  WORLD STATE  →  ARBITER  →  GENERATOR  →  CHAT
+VIDEO  AUDIO  CHAT   →  WORLD STATE  →  ARBITER  →  GENERATOR  →  SAFETY  →  CHAT
 (perception)            (blackboard)    (when?)     (what?)       (filter)   (post)
 ```
 
-- **Adapters** (`adapters/`) abstract the platform: file-replay + YouTube (Twitch later).
-- **Model backends** (`models/`) abstract the models: small ones local (ASR, VLM),
+* **Adapters** (`adapters/`) abstract the platform: file-replay + YouTube (Twitch later).
+* **Model backends** (`models/`) abstract the models: small ones local (ASR, VLM),
   the generator hosted (OpenAI-compatible — GPT-5.5 / Grok).
+* **Memory** (`memory/`) spans four layers: working buffer, episodic summarization,
+  durable semantic facts (cross-stream), and self-memory + dedup.
 
-## Setup
+<p align="right">(<a href="#readme-top">back to top</a>)</p>
 
-```bash
-source venv/bin/activate
-pip install -e ".[dev]"          # core + dev tooling
-# later phases:
-# pip install -e ".[asr,youtube,llm]"
-cp .env.example .env             # fill in keys when wiring Phase 1
-```
+### Built With
 
-## Run (offline)
+* [![Python][python-shield]][python-url]
+* [faster-whisper](https://github.com/SYSTRAN/faster-whisper) — streaming ASR
+* [yt-dlp](https://github.com/yt-dlp/yt-dlp) + [PyAV](https://github.com/PyAV-Org/PyAV) — stream capture
+* [Pydantic](https://docs.pydantic.dev/) — config + schemas
+* [OpenAI-compatible client](https://github.com/openai/openai-python) — hosted generator
 
-```bash
+<p align="right">(<a href="#readme-top">back to top</a>)</p>
+
+
+
+<!-- GETTING STARTED -->
+## Getting Started
+
+To get a local copy up and running, follow these steps.
+
+### Prerequisites
+
+* Python 3.12+
+* A virtualenv (Phase 0 installs and runs with nothing else; heavy deps are optional extras)
+
+### Installation
+
+1. Clone the repo
+   ```sh
+   git clone https://github.com/OxMarco/Lingus.git
+   cd Lingus
+   ```
+2. Create and activate a virtualenv
+   ```sh
+   python -m venv venv
+   source venv/bin/activate
+   ```
+3. Install the package (core + dev tooling)
+   ```sh
+   pip install -e ".[dev]"
+   ```
+4. Install optional extras for later phases as needed
+   ```sh
+   pip install -e ".[asr,youtube,llm]"
+   ```
+5. Copy the env template and fill in keys when wiring Phase 1
+   ```sh
+   cp .env.example .env
+   ```
+
+<p align="right">(<a href="#readme-top">back to top</a>)</p>
+
+
+
+<!-- USAGE EXAMPLES -->
+## Usage
+
+Run the loop offline from a recorded segment — no network or API keys required:
+
+```sh
 python -m lingus.app --segment tests/samples/demo
 ```
 
-Drives the loop from a recorded segment with no network or API keys. You should see
-the world-state populate with chat + transcript events, then a simple offline
-cognition tick may post a deterministic bot reply.
+You should see the world-state populate with chat + transcript events, then a simple
+offline cognition tick may post a deterministic bot reply.
 
-```bash
+```sh
 python -m lingus.app --segment tests/samples/cake --speed 100
 ```
 
 This sample replays scene + speech context for a chocolate-cake stain and logs the
 bot's reply through the file replay chat adapter.
 
-## Test
+Run the test suite and linter:
 
-```bash
+```sh
 pytest
 ruff check src tests
 ```
 
-## Build status
+<p align="right">(<a href="#readme-top">back to top</a>)</p>
+
+
+
+<!-- ROADMAP -->
+## Roadmap
 
 - [x] **Phase 0** — skeleton: config, world-state, persona schema, adapter/model ABCs, offline loop
 - [x] **Phase 0.5** — context snapshot, simple arbiter, deterministic offline reply loop
-- [~] **Phase 1** — speech → reply → chat: capture + local ASR + hosted/template generator + governor wired and validated live in observe mode. Remaining: validate the real LLM generator live; post path lands with the Twitch adapter
-- [~] **Phase 2** — chat perception: `ChatTrendDetector` (hype/pile-on) built and wired into the arbiter. Remaining: real YouTube live-chat ingestion (`ObserveChatAdapter.incoming` yields nothing)
+- [ ] **Phase 1** — speech → reply → chat: capture + local ASR + hosted/template generator + governor wired and validated live in observe mode
+    - Remaining: validate the real LLM generator live; post path lands with the Twitch adapter
+- [ ] **Phase 2** — chat perception: `ChatTrendDetector` (hype/pile-on) built and wired into the arbiter
+    - Remaining: real YouTube live-chat ingestion (`ObserveChatAdapter.incoming` yields nothing)
 - [x] **Phase 3** — memory: working + self-memory + dedup/bit-fatigue + episodic summarization + semantic (durable cross-stream facts)
-- [ ] **Phase 4** — video (frame gating + VLM scene state) — `youtube.py` `video_frames()` is a stub
-- [ ] **Phase 5** — hardening: output moderation pass (incl. the regex spam/offensive filter), staleness/barge-in, per-signal cooldowns. The `ModerationBackend` ABC + `moderation:` config exist but are **not** wired into the post path yet — the non-negotiable gate before any real posting
+- [ ] **Phase 4** — video: frame gating + VLM scene state — `youtube.py` `video_frames()` is a stub
+- [ ] **Phase 5** — hardening: output moderation pass, staleness/barge-in, per-signal cooldowns
 - [ ] **Phase 6** — eval loop (record / replay / judge)
 - [ ] **Final** — Twitch adapter
 
-Legend: `[x]` done · `[~]` partial · `[ ]` not started.
-```
+See the [open issues](https://github.com/OxMarco/Lingus/issues) for a full list of
+proposed features (and known issues).
+
+<p align="right">(<a href="#readme-top">back to top</a>)</p>
+
+
+
+<!-- CONTRIBUTING -->
+## Contributing
+
+Contributions are what make the open source community such an amazing place to learn,
+inspire, and create. Any contributions you make are **greatly appreciated**.
+
+If you have a suggestion that would make this better, please fork the repo and create
+a pull request. You can also simply open an issue with the tag "enhancement".
+
+1. Fork the Project
+2. Create your Feature Branch (`git checkout -b feature/AmazingFeature`)
+3. Commit your Changes (`git commit -m 'Add some AmazingFeature'`)
+4. Push to the Branch (`git push origin feature/AmazingFeature`)
+5. Open a Pull Request
+
+<p align="right">(<a href="#readme-top">back to top</a>)</p>
+
+
+
+<!-- LICENSE -->
+## License
+
+Distributed under the project license. See `LICENSE` for more information.
+
+<p align="right">(<a href="#readme-top">back to top</a>)</p>
+
+
+
+<!-- CONTACT -->
+## Contact
+
+OxMarco - [@OxMarco](https://github.com/OxMarco)
+
+Project Link: [https://github.com/OxMarco/Lingus](https://github.com/OxMarco/Lingus)
+
+<p align="right">(<a href="#readme-top">back to top</a>)</p>
+
+
+
+<!-- ACKNOWLEDGMENTS -->
+## Acknowledgments
+
+* [Best-README-Template](https://github.com/othneildrew/Best-README-Template)
+* [SillyTavern character cards + lorebooks](https://github.com/SillyTavern/SillyTavern) — persona design reference
+* [Pipecat](https://github.com/pipecat-ai/pipecat) — pipeline spine inspiration
+* [faster-whisper](https://github.com/SYSTRAN/faster-whisper)
+
+<p align="right">(<a href="#readme-top">back to top</a>)</p>
+
+
+
+<!-- MARKDOWN LINKS & IMAGES -->
+[contributors-shield]: https://img.shields.io/github/contributors/OxMarco/Lingus.svg?style=for-the-badge
+[contributors-url]: https://github.com/OxMarco/Lingus/graphs/contributors
+[forks-shield]: https://img.shields.io/github/forks/OxMarco/Lingus.svg?style=for-the-badge
+[forks-url]: https://github.com/OxMarco/Lingus/network/members
+[stars-shield]: https://img.shields.io/github/stars/OxMarco/Lingus.svg?style=for-the-badge
+[stars-url]: https://github.com/OxMarco/Lingus/stargazers
+[issues-shield]: https://img.shields.io/github/issues/OxMarco/Lingus.svg?style=for-the-badge
+[issues-url]: https://github.com/OxMarco/Lingus/issues
+[python-shield]: https://img.shields.io/badge/Python-3.12+-3776AB?style=for-the-badge&logo=python&logoColor=white
+[python-url]: https://www.python.org/

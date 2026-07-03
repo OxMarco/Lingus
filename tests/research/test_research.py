@@ -88,6 +88,20 @@ async def test_researcher_llm_path_tolerates_chatty_json():
     assert profile.facts == ["fact one"]
 
 
+async def test_researcher_llm_path_uses_structured_backend():
+    class FakeStructuredLLM:
+        async def generate_structured(self, response_model, messages, **opts):
+            return response_model(facts=["the streamer builds tiny robots"], summary="Robots.")
+
+        async def generate(self, messages, **opts):  # pragma: no cover - should not run
+            raise AssertionError("raw JSON fallback should not be used")
+
+    researcher = ChannelResearcher(FakeSearch([]), llm=FakeStructuredLLM())
+    profile = await researcher.research(ChannelIdentity(platform="youtube", name="Builder"))
+    assert profile.facts == ["the streamer builds tiny robots"]
+    assert profile.summary == "Robots."
+
+
 async def test_researcher_falls_back_when_llm_returns_no_facts():
     llm = FakeLLM(json.dumps({"facts": [], "summary": ""}))
     researcher = ChannelResearcher(FakeSearch([]), llm=llm)

@@ -110,6 +110,7 @@ class WorldState:
         # lines that have aged out of the working window and await summarization
         # (so a long stream's early context isn't simply lost on eviction).
         self.episodic_summary: str = ""
+        self.episodic_history: list[str] = []
         self._pending_summary: list[str] = []
         # Top durable facts currently surfaced from the semantic store (refreshed
         # by the consolidation loop; read into the generator's context).
@@ -143,6 +144,9 @@ class WorldState:
 
     def set_episodic_summary(self, summary: str) -> None:
         self.episodic_summary = summary
+
+    def set_episodic_history(self, summaries: list[str]) -> None:
+        self.episodic_history = [s.strip() for s in summaries if s.strip()]
 
     def update_scene(self, scene: SceneState) -> None:
         scene.updated_ts = time.monotonic()

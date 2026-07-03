@@ -26,6 +26,7 @@ class ContextSnapshot:
     latest_event: Event | None
     now: float
     episodic: str = ""  # the running "stream so far" narrative
+    episodic_history: list[str] = field(default_factory=list)  # prior stream summaries
     semantic_facts: list[str] = field(default_factory=list)  # durable cross-stream facts
 
     def scene_summary(self) -> str:
@@ -44,11 +45,13 @@ class ContextSnapshot:
     def to_prompt_context(self) -> str:
         chat = "\n".join(f"- {line.author}: {line.text}" for line in self.recent_chat)
         own_messages = "\n".join(f"- {text}" for text in self.own_messages)
+        history = "\n".join(f"- {summary}" for summary in self.episodic_history)
         facts = "\n".join(f"- {fact}" for fact in self.semantic_facts)
         return "\n".join(
             [
                 "Current stream context:",
                 f"Known facts:\n{facts or '- none yet'}",
+                f"Past stream memories:\n{history or '- none yet'}",
                 f"Stream so far: {self.episodic or 'just started'}",
                 f"Scene: {self.scene_summary() or 'unknown'}",
                 f"Recent speech: {self.transcript or 'none'}",
@@ -89,5 +92,6 @@ def build_context_snapshot(
         latest_event=latest_event,
         now=current_time,
         episodic=world.episodic_summary,
+        episodic_history=list(world.episodic_history),
         semantic_facts=list(world.semantic_facts),
     )

@@ -7,10 +7,10 @@ boundaries*: accumulate audio, run Silero VAD over the rolling buffer, and flush
 to Whisper at a pause.
 
 The catch: Whisper pads every call to a 30s mel, so each transcription has a
-fixed ~3.5s cost on a CPU `medium` model — real-time break-even is ~4s of audio
-per call. Pure pause-segmentation would flush 1-2s utterances and fall behind
-live. So we *amortize*: we only flush on a pause once ~`min_flush_seconds` of
-audio has accrued, batching short utterances into one call cut at a clean pause.
+fixed CPU cost — real-time break-even is several seconds of audio per call. Pure
+pause-segmentation would flush 1-2s utterances and fall behind live. So we
+*amortize*: we only flush on a pause once ~`min_flush_seconds` of audio has
+accrued, batching short utterances into one call cut at a clean pause.
 A long lull flushes early (don't strand a final short sentence), and a
 `window_seconds` cap force-flushes a pauseless monologue so latency stays bounded.
 
@@ -63,7 +63,7 @@ def _is_hallucination(text: str, no_speech_prob: float, avg_logprob: float) -> b
 class FasterWhisperASR(ASRBackend):
     def __init__(
         self,
-        model_size: str = "medium",
+        model_size: str = "turbo",
         device: str = "auto",
         language: str | None = None,
         *,
@@ -79,7 +79,7 @@ class FasterWhisperASR(ASRBackend):
         from faster_whisper.vad import VadOptions, get_speech_timestamps
 
         # ctranslate2 has no Metal backend; on Apple Silicon ASR runs on CPU.
-        # int8 keeps a `medium` model real-time at a ~10s VAD cap on a laptop core.
+        # int8 + a ~10s VAD cap gives turbo a fair shot on a high-end local CPU.
         resolved_device = "cpu" if device in ("auto", "metal") else device
         log.info("loading faster-whisper '%s' on %s (int8)…", model_size, resolved_device)
         self._model = WhisperModel(model_size, device=resolved_device, compute_type="int8")

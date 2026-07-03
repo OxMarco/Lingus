@@ -88,9 +88,21 @@ def test_empty_message_is_dropped():
 
 
 # --- temporizer ---
-def test_typing_delay_grows_with_length_and_is_clamped():
+def test_typing_delay_is_disabled_by_default():
     gov = _gov(
         typing_cps=10.0, typing_base_seconds=0.4, typing_min_seconds=0.8, typing_max_seconds=5.0
+    )
+
+    assert gov.typing_delay("a" * 1000) == 0.0
+
+
+def test_typing_delay_grows_with_length_and_is_clamped():
+    gov = _gov(
+        typing_enabled=True,
+        typing_cps=10.0,
+        typing_base_seconds=0.4,
+        typing_min_seconds=0.8,
+        typing_max_seconds=5.0,
     )
     short = gov.typing_delay("hi")
     medium = gov.typing_delay("a" * 30)

@@ -11,8 +11,8 @@ insults-in-jest, and slang alone.
 
 Like the output governor, this is a **deterministic gate** in the post path: no
 model, no I/O, cheap to unit-test. It implements the async `ModerationBackend`
-contract so a real guard model (Llama Guard, a platform API) can drop in later
-behind the same seam without touching the loop.
+contract so a deployment that genuinely needs heavier moderation can add it
+behind the same seam, without making the default hot path slower.
 
 `backend: none` in config disables it — for offline replay tuning only. Any
 real posting must keep a backend on; the loop logs loudly when it's off.
@@ -34,7 +34,7 @@ from .models.base import ModerationBackend, ModerationResult
 #
 # This is intentionally conservative — a starting set, not a comprehensive
 # policy. Deployments extend it via ``moderation.extra_patterns`` in config,
-# and swap in a real guard model when the regex pass creaks.
+# and only add heavier moderation when the regex pass proves insufficient.
 
 # Leetspeak-tolerant character classes for common slur obfuscation.
 _A = r"[a@4]"

@@ -1,8 +1,11 @@
+import asyncio
+
 import pytest
 
 from lingus.app import BotLoop
 from lingus.arbiter import ArbiterDecision
 from lingus.config import Settings
+from lingus.control import ControlState
 from lingus.monitor import NullMonitor, TickReport
 from lingus.persona.schema import PersonaSpec
 from lingus.world_state import Event
@@ -93,6 +96,33 @@ async def test_loop_emits_report_even_when_holding():
     assert monitor.reports[0].posted is None
 
 
+@pytest.mark.asyncio
+async def test_loop_tick_report_includes_memory_context():
+    settings = Settings.model_validate({"platform": "file_replay"})
+    monitor = RecordingMonitor()
+    loop = BotLoop(
+        settings=settings,
+        persona=PersonaSpec(name="Gremlin", voice="brief"),
+        capture=EmptyCaptureAdapter(),
+        chat=CollectingChatAdapter(),
+        segment=None,
+        monitor=monitor,
+    )
+    loop.world.add_event(
+        Event(source="speech", kind="transcript", payload={"text": "Tuchel named the squad"})
+    )
+    loop.world.set_episodic_summary("they discussed the squad")
+    loop.world.set_episodic_history(["last stream ended with a cake stain"])
+    loop.world.semantic_facts = ["the streamer likes football"]
+
+    await loop._cognition_tick()
+
+    report = monitor.reports[0]
+    assert report.episodic_summary == "they discussed the squad"
+    assert report.episodic_history == ["last stream ended with a cake stain"]
+    assert report.semantic_facts == ["the streamer likes football"]
+
+
 def test_dashboard_renders_synthetic_ticks_headless():
     pytest.importorskip("rich")  # skip if the optional extra isn't installed
     from rich.console import Console
@@ -127,3 +157,55 @@ def test_dashboard_renders_synthetic_ticks_headless():
     console = Console(file=None, width=100, record=True)
     console.print(dash._render())
     assert console.export_text().strip()
+
+
+@pytest.mark.asyncio
+async def test_web_monitor_surfaces_server_task_failure():
+    from lingus.webui import WebMonitor
+
+    class FailingWebMonitor(WebMonitor):
+        async def _serve(self) -> None:
+            raise RuntimeError("port already taken")
+
+    monitor = FailingWebMonitor(
+        ControlState(Settings.model_validate({})), "Gremlin", "file_replay"
+    )
+    monitor.start()
+    await asyncio.sleep(0)
+
+    with pytest.raises(RuntimeError, match="web UI server failed"):
+        monitor.on_tick(
+            TickReport(
+                t=0.0,
+                decision=ArbiterDecision(should_reply=False, score=0.0),
+                mood=0.0,
+                n_events=0,
+                transcript_tail="",
+            )
+        )
+    await monitor.wait_stopped()
+
+
+def test_web_monitor_payload_includes_memory_context():
+    from lingus.context import ChatLine
+    from lingus.webui import WebMonitor
+
+    monitor = WebMonitor(ControlState(Settings.model_validate({})), "Gremlin", "file_replay")
+
+    payload = monitor._tick_payload(  # noqa: SLF001 - payload builder is the unit under test
+        TickReport(
+            t=0.0,
+            decision=ArbiterDecision(should_reply=False, score=0.0),
+            mood=0.0,
+            n_events=0,
+            transcript_tail="",
+            recent_chat=[ChatLine(author="viewer", text="hi")],
+            episodic_summary="current stream summary",
+            episodic_history=["prior stream summary"],
+            semantic_facts=["the streamer likes football"],
+        )
+    )
+
+    assert payload["episodic_summary"] == "current stream summary"
+    assert payload["episodic_history"] == ["prior stream summary"]
+    assert payload["semantic_facts"] == ["the streamer likes football"]

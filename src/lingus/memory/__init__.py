@@ -7,12 +7,18 @@ that *act* on memory:
 - `RepetitionGuard` — self-memory dedup + bit-fatigue, the deterministic defense
   against the #1 immersion-killer: a character that repeats itself.
 
-Episodic summarization and the semantic/long-term store land here next.
+Episodic summarization and semantic/long-term stores live here too.
 """
 
 from __future__ import annotations
 
-from .episodic import EpisodicSummarizer, ExtractiveSummarizer, LLMSummarizer
+from .episodic import (
+    EpisodicArchive,
+    EpisodicMemory,
+    EpisodicSummarizer,
+    ExtractiveSummarizer,
+    LLMSummarizer,
+)
 from .repetition import RepetitionGuard, jaccard, normalize
 from .semantic import (
     ExtractedFact,
@@ -25,6 +31,8 @@ from .semantic import (
 
 __all__ = [
     "EpisodicSummarizer",
+    "EpisodicArchive",
+    "EpisodicMemory",
     "ExtractedFact",
     "ExtractiveSummarizer",
     "FactExtractor",

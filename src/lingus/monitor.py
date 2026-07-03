@@ -53,6 +53,9 @@ class TickReport:
     n_events: int
     transcript_tail: str
     recent_chat: list[ChatLine] = field(default_factory=list)
+    episodic_summary: str = ""
+    episodic_history: list[str] = field(default_factory=list)
+    semantic_facts: list[str] = field(default_factory=list)
     scene_summary: str = ""
     posted: str | None = None  # message posted this tick, if any
     dropped: str | None = None  # message generated then dropped (stale/dup), if any

@@ -43,7 +43,7 @@ class YouTubeConfig(BaseModel):
 
 class ASRConfig(BaseModel):
     backend: str = "faster_whisper"
-    model_size: str = "medium"
+    model_size: str = "turbo"
     device: str = "auto"
     # Most streams are single-language; pinning skips Whisper's per-window
     # detection (no flapping to the wrong language) and trims latency. Default to
@@ -52,10 +52,25 @@ class ASRConfig(BaseModel):
     language: str | None = "en"
     # Whisper pads every chunk to 30s internally, so a 5s window pays the full
     # encoder cost for a sliver of audio (~6x waste). 10s windows cut real-time
-    # factor roughly in half — enough headroom to run medium/large-v3-turbo on
+    # factor roughly in half — enough headroom to run turbo on a strong local
     # CPU — and give the model more context, at the cost of +5s latency. Drop to
     # 5s only if you need minimum latency and run a small model.
     window_seconds: float = 10.0
+
+
+class AudioGateConfig(BaseModel):
+    # "spectral" = lightweight local speech/music gate; "hf_ast" = Hugging Face
+    # AudioSet classifier; "none" disables pre-ASR gating.
+    backend: str = "spectral"
+    window_seconds: float = Field(default=2.0, gt=0.0)
+    speech_threshold: float = Field(default=0.45, ge=0.0, le=1.0)
+    music_threshold: float = Field(default=0.65, ge=0.0, le=1.0)
+    silence_rms: float = Field(default=0.003, ge=0.0)
+    replacement_silence_seconds: float = Field(default=0.5, ge=0.0)
+    hf_model: str = "MIT/ast-finetuned-audioset-10-10-0.4593"
+    hf_top_k: int = Field(default=12, ge=1)
+    hf_cache_dir: str = ".lingus/hf/hub"
+    hf_local_files_only: bool = True
 
 
 class LLMConfig(BaseModel):
@@ -66,7 +81,20 @@ class LLMConfig(BaseModel):
 
 
 class VLMConfig(BaseModel):
-    backend: str = "none"
+    # "mlx_vlm" = local Apple Silicon VLM via mlx-vlm; "local_cv" = cheap local
+    # frame analysis fallback; "none" disables live video.
+    backend: str = "mlx_vlm"
+    model: str = "mlx-community/Qwen2.5-VL-3B-Instruct-4bit"
+    max_tokens: int = Field(default=180, gt=0)
+    temperature: float = Field(default=0.0, ge=0.0)
+    fallback_to_local_cv: bool = True
+    # Phase 4 frame gate: how different a sampled RGB frame must be from the
+    # last accepted frame before local analysis runs again.
+    frame_diff_threshold: float = Field(default=0.08, ge=0.0, le=1.0)
+    frame_min_interval_seconds: float = Field(default=3.0, ge=0.0)
+    max_sample_pixels: int = Field(default=4096, ge=1)
+    brightness_change_threshold: float = Field(default=0.16, ge=0.0, le=1.0)
+    contrast_change_threshold: float = Field(default=0.10, ge=0.0, le=1.0)
 
 
 class ModerationConfig(BaseModel):
@@ -82,6 +110,7 @@ class ModerationConfig(BaseModel):
 
 class ModelsConfig(BaseModel):
     asr: ASRConfig = Field(default_factory=ASRConfig)
+    audio_gate: AudioGateConfig = Field(default_factory=AudioGateConfig)
     llm: LLMConfig = Field(default_factory=LLMConfig)
     vlm: VLMConfig = Field(default_factory=VLMConfig)
     moderation: ModerationConfig = Field(default_factory=ModerationConfig)
@@ -124,6 +153,9 @@ class MemoryConfig(BaseModel):
     episodic_enabled: bool = True
     episodic_batch_lines: int = Field(default=8, ge=1)  # summarize once this many pile up
     episodic_max_chars: int = Field(default=800, gt=0)  # cap on the running narrative
+    episodic_path: str = ".lingus/episodes.json"  # per-stream summaries across runs
+    episodic_max_entries: int = Field(default=20, ge=1)
+    episodic_top_k: int = Field(default=3, ge=0)  # prior summaries surfaced into context
     # Semantic memory: durable facts persisted across streams.
     semantic_enabled: bool = True
     semantic_path: str = ".lingus/semantic.json"  # where facts persist between runs
@@ -167,7 +199,8 @@ class OutputConfig(BaseModel):
     burst: int = Field(default=2, ge=1)
     # On an over-length reply, try one tighter regeneration before truncating.
     regenerate_on_overflow: bool = True
-    # Temporizer — emulate human typing time so a sentence can't land instantly.
+    # Optional flavor delay. Keep off by default so live replies stay responsive.
+    typing_enabled: bool = False
     typing_cps: float = Field(default=15.0, gt=0.0)  # characters "typed" per second
     typing_base_seconds: float = Field(default=0.4, ge=0.0)  # reaction beat before typing
     typing_min_seconds: float = Field(default=0.8, ge=0.0)

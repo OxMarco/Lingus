@@ -66,6 +66,62 @@ def _direct_address_world():
     return build_context_snapshot(world)
 
 
+def test_direct_address_accepts_punctuation_in_chat_and_speech():
+    arbiter = SimpleArbiter(
+        fire_threshold=1.0,
+        cooldown_seconds=20.0,
+        min_seconds_between_posts=8.0,
+    )
+
+    for source, text in (
+        ("chat", "Lingus, I think you're right"),
+        ("chat", "hey @Lingus! you called it"),
+        ("speech", "Lingus, I think you're right"),
+        ("speech", "hey Lingus. good call"),
+    ):
+        world = WorldState()
+        kind = "message" if source == "chat" else "transcript"
+        payload = {"text": text}
+        if source == "chat":
+            payload["author"] = "viewer"
+        world.add_event(Event(source=source, kind=kind, payload=payload))
+
+        decision = arbiter.decide(
+            build_context_snapshot(world),
+            persona_name="Lingus",
+            seconds_since_own_message=float("inf"),
+        )
+
+        assert decision.should_reply
+        assert "direct_address" in decision.reasons
+
+
+def test_direct_address_does_not_match_inside_other_words():
+    world = WorldState()
+    world.add_event(
+        Event(
+            source="speech",
+            kind="transcript",
+            payload={"text": "that linguistics take is right"},
+        )
+    )
+    snapshot = build_context_snapshot(world)
+    arbiter = SimpleArbiter(
+        fire_threshold=1.0,
+        cooldown_seconds=20.0,
+        min_seconds_between_posts=8.0,
+    )
+
+    decision = arbiter.decide(
+        snapshot,
+        persona_name="Lingus",
+        seconds_since_own_message=float("inf"),
+    )
+
+    assert not decision.should_reply
+    assert "direct_address" not in decision.reasons
+
+
 def test_effective_threshold_decays_after_speaking():
     arbiter = SimpleArbiter(
         fire_threshold=1.0,

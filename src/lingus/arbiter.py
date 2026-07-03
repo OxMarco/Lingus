@@ -16,6 +16,7 @@ speak  ⟺  salience(now)  >  effective_threshold(now)
 from __future__ import annotations
 
 import math
+import re
 from dataclasses import dataclass, field
 
 from .context import ContextSnapshot
@@ -179,9 +180,11 @@ class SimpleArbiter:
 
     @staticmethod
     def _mentions_persona(text: str, persona_name: str) -> bool:
-        lowered = text.lower()
-        name = persona_name.lower()
-        return f"@{name}" in lowered or name in lowered.split()
+        name = persona_name.strip()
+        if not name:
+            return False
+        pattern = rf"(?<!\w)@?{re.escape(name)}(?!\w)"
+        return re.search(pattern, text, flags=re.IGNORECASE) is not None
 
     @staticmethod
     def _looks_like_question(text: str) -> bool:

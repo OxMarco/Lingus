@@ -7,17 +7,23 @@ name = "lingus"
 version = "0.1.0"
 description = "Real-time, characterful live-stream interaction bot (perception-cognition loop)."
 readme = "README.md"
-requires-python = ">=3.12"
+requires-python = ">=3.12,<3.14"
 dependencies = [
     "pydantic>=2.7",
     "pydantic-settings>=2.3",
     "pyyaml>=6.0",
+    "tenacity>=9.0",
 ]
 
 # Heavy / optional deps are grouped so Phase 0 installs and runs with nothing else.
 [project.optional-dependencies]
 # Phase 1: speech -> reply -> chat
-asr = ["faster-whisper>=1.0"]
+asr = ["faster-whisper>=1.0", "numpy>=1.26"]  # ASR + lightweight spectral audio gate
+audio-ml = [
+    "transformers>=4.44",
+    "torch>=2.2",
+    "librosa>=0.10",
+]  # optional Hugging Face AudioSet speech/music gate
 youtube = [
     "yt-dlp>=2024.0",
     "av>=12.0",
@@ -25,11 +31,18 @@ youtube = [
     "google-api-python-client>=2.0",
     "google-auth-oauthlib>=1.2",
 ]
-llm = ["openai>=1.30"]  # OpenAI-compatible client (GPT-5.5 / Grok via base_url)
+llm = [
+    "openai>=2.0,<3",
+    "instructor>=1.15,<2",
+]  # OpenAI-compatible text client + structured outputs
 dashboard = ["rich>=13.0"]  # live terminal tuning dashboard (lingus --dashboard)
 web = ["aiohttp>=3.9"]  # live web tuner UI sidecar (lingus --web)
 # Phase 4: video
 video = ["opencv-python>=4.9", "scenedetect>=0.6", "ImageHash>=4.3"]
+# Local Apple Silicon VLM for Phase 4 scene state (no hosted vision calls).
+video-mlx = ["mlx-vlm>=0.1.0"]
+# Local speech/audio embeddings for richer speech tagging.
+speech-tags = ["sherpa-onnx>=1.10"]
 # Phase 3: semantic memory
 memory = ["chromadb>=0.5"]
 # Cold-start channel research: live web search for the channel profiler

@@ -12,6 +12,7 @@ import asyncio
 import contextlib
 import signal
 import time
+from typing import TYPE_CHECKING
 
 from .adapters.base import ChatAdapter, StreamCaptureAdapter
 from .adapters.file_replay import (
@@ -29,6 +30,7 @@ from .control import ControlState
 from .generator import ReplyGenerator, TemplateReplyGenerator
 from .logging import get_logger, setup_logging
 from .memory import (
+    EpisodicArchive,
     EpisodicSummarizer,
     ExtractiveSummarizer,
     FactExtractor,
@@ -36,12 +38,16 @@ from .memory import (
     RepetitionGuard,
     SemanticStore,
 )
-from .models.base import ASRBackend, LLMBackend, ModerationBackend
+from .models.base import ASRBackend, AudioGateBackend, LLMBackend, ModerationBackend, VLMBackend
 from .monitor import Monitor, NullMonitor, TickReport
 from .output_governor import OutputGovernor
 from .persona.loader import load_persona
 from .persona.schema import PersonaSpec
-from .world_state import Event, SceneState, WorldState
+from .video import FrameGate, scene_content_changed, scene_event_changed
+from .world_state import Event, SceneState, WorldState, event_summary
+
+if TYPE_CHECKING:
+    from .research import ChannelIdentity, ChannelProfile
 
 log = get_logger("lingus.app")
 
@@ -87,10 +93,13 @@ class BotLoop:
         reply_generator: ReplyGenerator | None = None,
         monitor: Monitor | None = None,
         asr: ASRBackend | None = None,
+        audio_gate: AudioGateBackend | None = None,
+        vlm: VLMBackend | None = None,
         controls: ControlState | None = None,
         summarizer: EpisodicSummarizer | None = None,
         fact_extractor: FactExtractor | None = None,
         safety: ModerationBackend | None = None,
+        frame_gate: FrameGate | None = None,
     ) -> None:
         self.settings = settings
         self.persona = persona
@@ -100,8 +109,14 @@ class BotLoop:
         self.replay_speed = replay_speed
         self.monitor = monitor or NullMonitor()
         self.asr = asr
+        self.audio_gate = audio_gate
+        self.vlm = vlm
         self.safety = safety
         self.controls = controls
+        self.frame_gate = frame_gate or FrameGate(
+            diff_threshold=settings.models.vlm.frame_diff_threshold,
+            min_interval_seconds=settings.models.vlm.frame_min_interval_seconds,
+        )
         self.arbiter = SimpleArbiter(
             fire_threshold=settings.arbiter.fire_threshold,
             cooldown_seconds=settings.arbiter.cooldown_seconds,
@@ -131,6 +146,7 @@ class BotLoop:
             min_seconds_between_posts=settings.output.min_seconds_between_posts,
             burst=settings.output.burst,
             posts_per_minute=settings.output.posts_per_minute,
+            typing_enabled=settings.output.typing_enabled,
             typing_cps=settings.output.typing_cps,
             typing_base_seconds=settings.output.typing_base_seconds,
             typing_min_seconds=settings.output.typing_min_seconds,
@@ -143,6 +159,11 @@ class BotLoop:
         self.summarizer = summarizer or ExtractiveSummarizer(
             max_chars=settings.memory.episodic_max_chars
         )
+        self.episodes = (
+            EpisodicArchive(max_entries=settings.memory.episodic_max_entries)
+            if settings.memory.episodic_enabled
+            else None
+        )
         self.semantic = (
             SemanticStore(max_facts=settings.memory.semantic_max_facts)
             if settings.memory.semantic_enabled
@@ -152,10 +173,13 @@ class BotLoop:
         self.world = WorldState()
         self._stop = asyncio.Event()
         self._task_error: BaseException | None = None
+        self._replay_tasks: list[asyncio.Task[None]] = []
         self._last_tick = time.monotonic()  # for mood decay between ticks
+        self._dropped_reply_backoff_until = 0.0
 
     async def run(self) -> None:
         tasks: list[asyncio.Task[None]] = []
+        self._replay_tasks = []
         capture_started = False
         chat_started = False
         monitor_started = False
@@ -168,8 +192,12 @@ class BotLoop:
             chat_started = True
             log.info("loop started as persona '%s'", self.persona.name)
 
-            # Long-term memory survives restarts: load facts from prior streams,
-            # and seed the context with the most-established ones up front.
+            # Long-term memory survives restarts: load prior summaries and facts,
+            # then seed context with a small relevant slice up front.
+            if self.episodes is not None:
+                self.episodes.load_file(self.settings.memory.episodic_path)
+                self._refresh_episodic_history()
+                log.info("episodic memory: %d stream summaries loaded", len(self.episodes))
             if self.semantic is not None:
                 self.semantic.load_file(self.settings.memory.semantic_path)
                 self.world.semantic_facts = [
@@ -177,10 +205,10 @@ class BotLoop:
                 ]
                 log.info("semantic memory: %d durable facts loaded", len(self.semantic))
 
-            tasks = [
-                asyncio.create_task(self._ingest_chat(), name="ingest_chat"),
-                asyncio.create_task(self._cognition_loop(), name="cognition"),
-            ]
+            chat_task = asyncio.create_task(self._ingest_chat(), name="ingest_chat")
+            tasks = [chat_task, asyncio.create_task(self._cognition_loop(), name="cognition")]
+            if self.settings.platform == "file_replay":
+                self._replay_tasks.append(chat_task)
             mem = self.settings.memory
             if mem.episodic_enabled or mem.semantic_enabled:
                 tasks.append(asyncio.create_task(self._consolidate_loop(), name="consolidate"))
@@ -188,11 +216,19 @@ class BotLoop:
                 # Live: capture audio -> ASR -> world state.
                 tasks.append(asyncio.create_task(self._ingest_audio_asr(), name="ingest_asr"))
             else:
-                # Offline convenience: replay pre-transcribed speech + pre-captioned scenes.
-                tasks.append(
-                    asyncio.create_task(self._ingest_transcript(), name="ingest_transcript")
+                # Offline convenience: replay pre-transcribed speech.
+                transcript_task = asyncio.create_task(
+                    self._ingest_transcript(), name="ingest_transcript"
                 )
-                tasks.append(asyncio.create_task(self._ingest_scene(), name="ingest_scene"))
+                tasks.append(transcript_task)
+                if self.settings.platform == "file_replay":
+                    self._replay_tasks.append(transcript_task)
+            if self.vlm is not None:
+                tasks.append(asyncio.create_task(self._ingest_video_vlm(), name="ingest_vlm"))
+            elif self.settings.platform == "file_replay":
+                scene_task = asyncio.create_task(self._ingest_scene(), name="ingest_scene")
+                tasks.append(scene_task)
+                self._replay_tasks.append(scene_task)
             for task in tasks:
                 task.add_done_callback(self._remember_task_failure)
             await self._stop.wait()
@@ -216,7 +252,13 @@ class BotLoop:
                 await self.capture.stop()
             if monitor_started:
                 self.monitor.stop()
+                wait_stopped = getattr(self.monitor, "wait_stopped", None)
+                if callable(wait_stopped):
+                    await wait_stopped()
             # Persist long-term memory so the next stream starts knowing the channel.
+            if self.episodes is not None:
+                with contextlib.suppress(OSError):
+                    self.episodes.save_file(self.settings.memory.episodic_path)
             if self.semantic is not None:
                 with contextlib.suppress(OSError):
                     self.semantic.save_file(self.settings.memory.semantic_path)
@@ -264,7 +306,10 @@ class BotLoop:
         """Live: pull captured audio through ASR into the world state."""
         if self.asr is None:
             return
-        async for tr in self.asr.transcribe_stream(self.capture.audio_frames()):
+        chunks = self.capture.audio_frames()
+        if self.audio_gate is not None:
+            chunks = self.audio_gate.gate_stream(chunks)
+        async for tr in self.asr.transcribe_stream(chunks):
             text = tr.text.strip()
             if not text:
                 continue
@@ -289,16 +334,51 @@ class BotLoop:
             self.world.update_scene(scene)
             self.world.add_event(Event(source="scene", kind="scene_change", payload=dict(row)))
 
+    async def _ingest_video_vlm(self) -> None:
+        """Live video: gate decoded frames, then update local scene state."""
+        if self.vlm is None:
+            return
+        async for frame in self.capture.video_frames():
+            if not self.frame_gate.accept(frame):
+                continue
+            prev_scene = self.world.scene
+            try:
+                scene = await self.vlm.describe_change(frame, prev_scene)
+            except Exception as exc:
+                log.warning("video scene analysis failed; keeping prior scene: %s", exc)
+                continue
+            if not scene_content_changed(prev_scene, scene):
+                log.debug("scene unchanged after VLM frame at %.2fs", frame.ts)
+                continue
+            self.world.update_scene(scene)
+            if not scene_event_changed(prev_scene, scene):
+                log.debug("scene state refreshed without new event at %.2fs", frame.ts)
+                continue
+            self.world.add_event(
+                Event(source="scene", kind="scene_change", payload=_scene_payload(scene))
+            )
+            log.info("scene: %s", event_summary(self.world.last_event()))
+
     # --- cognition ---
     async def _cognition_loop(self) -> None:
         while not self._stop.is_set():
             await asyncio.sleep(1.0)
             await self._cognition_tick()
-            # Phase-0 stop condition: if replay is exhausted, end after a quiet beat.
-            if self.settings.platform == "file_replay" and self.world.seconds_since_own_message():
-                last = self.world.last_event()
-                if last and last.age() > 2.0:
-                    self.request_stop()
+            # Offline replay stops only after every finite replay source has
+            # actually finished. Sparse recordings can have long gaps, so event age
+            # alone is not a safe exhaustion signal; empty recordings still need to
+            # stop once the sources have completed.
+            if self._replay_should_stop():
+                self.request_stop()
+
+    def _replay_exhausted(self) -> bool:
+        return bool(self._replay_tasks) and all(task.done() for task in self._replay_tasks)
+
+    def _replay_should_stop(self) -> bool:
+        if self.settings.platform != "file_replay" or not self._replay_exhausted():
+            return False
+        last = self.world.last_event()
+        return last is None or last.age() > 2.0
 
     async def _consolidate_loop(self) -> None:
         """Move aged-out transcript into the slower memory layers.
@@ -323,17 +403,65 @@ class BotLoop:
         if not lines:
             return
         if mem.episodic_enabled:
-            summary = await self.summarizer.summarize(self.world.episodic_summary, lines)
-            self.world.set_episodic_summary(summary)
-            log.debug("episodic summary updated (%d lines folded)", len(lines))
+            try:
+                summary = await self.summarizer.summarize(self.world.episodic_summary, lines)
+            except Exception as exc:
+                log.warning("episodic summarization failed; keeping prior summary: %s", exc)
+            else:
+                self.world.set_episodic_summary(summary)
+                self._persist_episodic_summary()
+                self._refresh_episodic_history()
+                log.debug("episodic summary updated (%d lines folded)", len(lines))
         if self.semantic is not None:
-            for ef in await self.fact_extractor.extract(lines):
+            try:
+                facts = await self.fact_extractor.extract(lines)
+            except Exception as exc:
+                log.warning("semantic fact extraction failed; skipping batch: %s", exc)
+                facts = []
+            for ef in facts:
                 self.semantic.add(ef.text, ef.subject)
             # Refresh the facts surfaced into context against the current moment.
             self.world.semantic_facts = [
                 f.text
-                for f in self.semantic.retrieve(self.world.recent_transcript(), mem.semantic_top_k)
+                for f in self.semantic.retrieve(
+                    self.world.recent_transcript(), mem.semantic_top_k
+                )
             ]
+
+    def _stream_memory_id(self) -> str:
+        if self.segment:
+            return f"file:{self.segment}"
+        video = self.settings.youtube.video_id
+        if self.settings.platform == "youtube" and video:
+            return f"youtube:{video}"
+        return f"{self.settings.platform}:live"
+
+    def _persist_episodic_summary(self) -> None:
+        if self.episodes is None or not self.world.episodic_summary.strip():
+            return
+        self.episodes.add(
+            self.world.episodic_summary,
+            stream_id=self._stream_memory_id(),
+            source=self.settings.platform,
+        )
+        with contextlib.suppress(OSError):
+            self.episodes.save_file(self.settings.memory.episodic_path)
+
+    def _refresh_episodic_history(self) -> None:
+        if self.episodes is None:
+            return
+        query = " ".join(
+            part
+            for part in (self.world.recent_transcript(), self.world.scene.last_event)
+            if part
+        )
+        current_id = self._stream_memory_id()
+        memories = [
+            e.summary
+            for e in self.episodes.retrieve(query, self.settings.memory.episodic_top_k + 1)
+            if e.stream_id != current_id
+        ][: self.settings.memory.episodic_top_k]
+        self.world.set_episodic_history(memories)
 
     async def _cognition_tick(self) -> None:
         # Live tuning: push the latest web-UI knob values onto the arbiter,
@@ -372,16 +500,18 @@ class BotLoop:
         snapshot: ContextSnapshot,
         decision: ArbiterDecision,
     ) -> tuple[str | None, str | None]:
-        """Generate, temporize, run the Gate-B staleness check, and post.
+        """Generate, run a cheap staleness check, and post.
 
-        Order matters: we compose the reply, "type" it for a human-like beat, and
-        only *then* re-check staleness and the hard output gate. The world keeps
-        moving while the bot types, so the staleness re-check after the delay
-        doubles as a cheap barge-in: if something newer took over, we drop.
+        Keep this path quick: the only optional delay is the output governor's
+        opt-in typing flavor. The staleness re-check is still useful because the
+        world can move while the generator is thinking, but it stays cheap and
+        local rather than becoming a mid-flight cancellation system.
 
         Returns (posted, dropped).
         """
         if not decision.should_reply:
+            return None, None
+        if time.monotonic() < self._dropped_reply_backoff_until:
             return None, None
 
         # Master switch: when chatting is disabled we still perceive and score
@@ -416,19 +546,16 @@ class BotLoop:
         # reworded) something the bot said recently, or that leans on a spent
         # catchphrase. Repetition is the #1 immersion-killer (CLAUDE.md §5).
         if self.repetition.is_repetitive(reply, self.world.own_messages, self.persona):
-            log.info("dropping repetitive reply: %s", reply)
-            return None, reply
+            return self._drop_generated_reply(reply, "repetitive")
 
-        # Temporizer: emulate the time a human takes to type this message, so a
-        # sentence can't land instantly on the heels of the prior one. Offline we
-        # compress it by the replay speed, same as the rest of the replay clock.
+        # Optional flavor delay. It is disabled by default for live responsiveness;
+        # offline replay compresses it by speed when enabled.
         delay = self.governor.typing_delay(reply) / max(self.replay_speed, 1e-9)
-        await asyncio.sleep(delay)
+        if delay > 0.0:
+            await asyncio.sleep(delay)
 
-        # Gate B — staleness: re-check that the moment we decided to speak into
-        # still wants a reply and that nothing newer became the thing worth
-        # reacting to. If it moved on (incl. during typing), drop and let the next
-        # tick re-evaluate rather than posting a stale line.
+        # Cheap staleness check: if generation took long enough for a newer event
+        # to become the trigger, drop and let the next tick re-evaluate.
         recheck = self.arbiter.decide(
             build_context_snapshot(self.world),
             persona_name=self.persona.name,
@@ -436,20 +563,32 @@ class BotLoop:
             mood=self.persona.mood.value,
         )
         if not recheck.should_reply or recheck.trigger_event is not decision.trigger_event:
-            log.info("dropping stale reply (context moved on): %s", reply)
-            return None, reply
+            return self._drop_generated_reply(reply, "stale")
 
         posted, dropped = await self._post_message(reply, drop_context="reply")
         if posted is not None:
             log.info("bot replied: %s", posted)
+        elif dropped is not None:
+            self._set_dropped_reply_backoff()
         return posted, dropped
+
+    def _drop_generated_reply(self, reply: str, reason: str) -> tuple[None, str]:
+        log.info("dropping %s reply: %s", reason, reply)
+        self._set_dropped_reply_backoff()
+        return None, reply
+
+    def _set_dropped_reply_backoff(self) -> None:
+        self._dropped_reply_backoff_until = time.monotonic() + max(
+            2.0,
+            self.settings.output.min_seconds_between_posts,
+        )
 
     async def _maybe_follow_trend(self) -> str | None:
         """Trend mirror: when chat converges on an emote/phrase, pile on with the
         same line — bypassing the generator entirely.
 
         This is a *copy*, not a "what do I say", so it skips the LLM and the
-        typing temporizer: a pile-on that lands seconds late reads worse than not
+        optional typing delay: a pile-on that lands seconds late reads worse than not
         joining at all. The deterministic guardrails still apply — the chat-enabled
         master switch and the output governor (rate limit + length cap) — and a
         successful follow feeds back into self-memory like any other post.
@@ -569,6 +708,9 @@ class BotLoop:
             n_events=len(self.world.events),
             transcript_tail=self.world.recent_transcript(3),
             recent_chat=list(snapshot.recent_chat),
+            episodic_summary=snapshot.episodic,
+            episodic_history=list(snapshot.episodic_history),
+            semantic_facts=list(snapshot.semantic_facts),
             scene_summary=snapshot.scene_summary(),
             posted=posted,
             dropped=dropped,
@@ -601,11 +743,22 @@ def _scene_from_row(row: dict) -> SceneState:
     )
 
 
+def _scene_payload(scene: SceneState) -> dict[str, object]:
+    return {
+        "activity": scene.activity,
+        "setting": scene.setting,
+        "on_screen_text": scene.on_screen_text,
+        "salient_objects": list(scene.salient_objects),
+        "last_event": scene.last_event,
+    }
+
+
 def _build_monitor(
     args: argparse.Namespace,
     persona: PersonaSpec,
     platform: str,
     controls: ControlState | None,
+    stream_info: dict[str, object] | None = None,
 ) -> Monitor:
     if args.web:
         try:
@@ -615,7 +768,13 @@ def _build_monitor(
         from .webui import WebMonitor
 
         assert controls is not None  # created alongside the --web flag in _amain
-        return WebMonitor(controls, persona.name, platform, port=args.web_port)
+        return WebMonitor(
+            controls,
+            persona.name,
+            platform,
+            stream_info=stream_info,
+            port=args.web_port,
+        )
     if not args.dashboard:
         return NullMonitor()
     try:
@@ -658,6 +817,78 @@ def _build_asr(settings: Settings) -> ASRBackend | None:
         language=cfg.language,
         window_seconds=cfg.window_seconds,
     )
+
+
+def _build_audio_gate(settings: Settings) -> AudioGateBackend | None:
+    """Pre-ASR classifier that keeps music/lyrics out of transcript context."""
+    if settings.platform == "file_replay":
+        return None
+    cfg = settings.models.audio_gate
+    if cfg.backend in ("", "none"):
+        log.info("audio gate: disabled")
+        return None
+    kwargs = {
+        "window_seconds": cfg.window_seconds,
+        "speech_threshold": cfg.speech_threshold,
+        "music_threshold": cfg.music_threshold,
+        "silence_rms": cfg.silence_rms,
+        "replacement_silence_seconds": cfg.replacement_silence_seconds,
+    }
+    if cfg.backend == "spectral":
+        from .models.audio_gate import SpectralAudioGate
+
+        log.info("audio gate: spectral speech/music filter")
+        return SpectralAudioGate(**kwargs)
+    if cfg.backend == "hf_ast":
+        from .models.audio_gate import HFAudioClassifierGate
+
+        log.info("audio gate: Hugging Face AudioSet classifier (%s)", cfg.hf_model)
+        return HFAudioClassifierGate(
+            model=cfg.hf_model,
+            top_k=cfg.hf_top_k,
+            cache_dir=cfg.hf_cache_dir,
+            local_files_only=cfg.hf_local_files_only,
+            **kwargs,
+        )
+    raise SystemExit(f"audio gate backend '{cfg.backend}' not implemented")
+
+
+def _build_vlm(settings: Settings) -> VLMBackend | None:
+    """Live video scene description, local-only."""
+    if settings.platform == "file_replay":
+        return None
+    cfg = settings.models.vlm
+    if cfg.backend in ("", "none"):
+        return None
+    if cfg.backend == "mlx_vlm":
+        from .models.local_vision import LocalFrameAnalyzer, MLXVLMSceneAnalyzer
+
+        fallback = (
+            LocalFrameAnalyzer(
+                max_sample_pixels=cfg.max_sample_pixels,
+                brightness_change_threshold=cfg.brightness_change_threshold,
+                contrast_change_threshold=cfg.contrast_change_threshold,
+            )
+            if cfg.fallback_to_local_cv
+            else None
+        )
+        log.info("vlm: local mlx_vlm (%s)", cfg.model)
+        return MLXVLMSceneAnalyzer(
+            model=cfg.model,
+            max_tokens=cfg.max_tokens,
+            temperature=cfg.temperature,
+            fallback=fallback,
+        )
+    if cfg.backend == "local_cv":
+        from .models.local_vision import LocalFrameAnalyzer
+
+        log.info("vlm: local_cv frame analyzer")
+        return LocalFrameAnalyzer(
+            max_sample_pixels=cfg.max_sample_pixels,
+            brightness_change_threshold=cfg.brightness_change_threshold,
+            contrast_change_threshold=cfg.contrast_change_threshold,
+        )
+    raise SystemExit(f"vlm backend '{cfg.backend}' not implemented")
 
 
 def _build_llm_backend(settings: Settings) -> LLMBackend | None:
@@ -709,13 +940,12 @@ def _build_fact_extractor(
     settings: Settings,
     backend: LLMBackend | None,
 ) -> FactExtractor | None:
-    """Semantic memory: LLM extraction when a key is present; else heuristic."""
+    """Semantic memory uses local heuristics.
+
+    Hosted LLM calls are reserved for episodic summarization and bot replies.
+    """
     if not settings.memory.semantic_enabled:
         return None
-    if backend is not None:
-        from .memory import LLMFactExtractor
-
-        return LLMFactExtractor(backend)
     return HeuristicFactExtractor()
 
 
@@ -723,7 +953,7 @@ async def _seed_research(
     args: argparse.Namespace,
     settings: Settings,
     llm_backend: LLMBackend | None,
-) -> None:
+) -> tuple[ChannelIdentity | None, ChannelProfile | None]:
     """Cold-start: profile the channel and seed durable memory before the loop.
 
     Runs once per channel (cached; re-researched after `research.refresh_days`),
@@ -734,7 +964,7 @@ async def _seed_research(
     """
     cfg = settings.research
     if args.no_research or not cfg.enabled or not settings.memory.semantic_enabled:
-        return
+        return None, None
     from .research import research_channel, resolve_identity
 
     video = args.video or settings.youtube.video_id
@@ -743,7 +973,7 @@ async def _seed_research(
     )
     if identity is None:
         log.info("research: no channel to research (set research.channel for this platform)")
-        return
+        return None, None
     log.info("research: profiling channel '%s' (%s)", identity.name, identity.platform)
     profile = await research_channel(
         identity,
@@ -753,12 +983,12 @@ async def _seed_research(
         max_facts=cfg.max_facts,
         max_queries=cfg.web_search.max_queries,
         max_results=cfg.web_search.max_results,
-        llm=llm_backend,
+        llm=None,
         force=args.research,
     )
     if profile is None or not profile.facts:
         log.info("research: no facts produced for '%s'", identity.name)
-        return
+        return identity, profile
     store = SemanticStore(max_facts=settings.memory.semantic_max_facts)
     store.load_file(settings.memory.semantic_path)
     before = len(store)
@@ -771,16 +1001,58 @@ async def _seed_research(
         len(profile.facts),
         identity.name,
     )
+    return identity, profile
+
+
+def _live_url(platform: str, video: str | None, channel_name: str) -> str:
+    if platform == "youtube" and video:
+        if video.startswith(("http://", "https://")):
+            return video
+        return f"https://www.youtube.com/watch?v={video}"
+    if platform == "twitch" and channel_name.strip():
+        handle = channel_name.strip().lstrip("@")
+        return f"https://www.twitch.tv/{handle}"
+    return ""
+
+
+def _stream_info(
+    args: argparse.Namespace,
+    settings: Settings,
+    identity: ChannelIdentity | None,
+    profile: ChannelProfile | None,
+) -> dict[str, object]:
+    platform = str(getattr(identity, "platform", settings.platform))
+    nickname = str(
+        getattr(profile, "channel", "")
+        or getattr(identity, "name", "")
+        or settings.research.channel
+        or ""
+    )
+    live_url = str(
+        getattr(identity, "url", "")
+        or _live_url(platform, args.video or settings.youtube.video_id, settings.research.channel)
+    )
+    summary = str(getattr(profile, "summary", "") or "")
+    facts = [str(f) for f in getattr(profile, "facts", [])]
+    source_urls = [str(u) for u in getattr(profile, "source_urls", [])]
+    return {
+        "nickname": nickname,
+        "platform": platform,
+        "live_url": live_url,
+        "summary": summary,
+        "facts": facts,
+        "source_urls": source_urls,
+    }
 
 
 async def _run_eval(args: argparse.Namespace) -> None:
     """Phase 6: replay a recorded segment offline and score the bot's outputs.
 
-    Uses the real generator (hosted LLM when a key is set, else the template) and
-    the LLM-as-judge when a backend is available, falling back to the deterministic
-    heuristic judge otherwise — so `--eval` produces a report with or without keys.
+    Uses the real generator (hosted LLM when a key is set, else the template), but
+    keeps judging heuristic/local so hosted calls are limited to summarization and
+    reply generation.
     """
-    from .eval import HeuristicJudge, LLMJudge, evaluate_segment
+    from .eval import HeuristicJudge, evaluate_segment
 
     settings = Settings.load(args.config)
     persona = load_persona(args.persona or settings.persona.path)
@@ -789,7 +1061,7 @@ async def _run_eval(args: argparse.Namespace) -> None:
         raise SystemExit("--eval needs --segment (a recorded segment directory)")
     llm_backend = _build_llm_backend(settings)
     reply_generator = _build_generator(settings, llm_backend)
-    judge = LLMJudge(llm_backend) if llm_backend is not None else HeuristicJudge()
+    judge = HeuristicJudge()
     log.info("eval judge: %s", type(judge).__name__)
     report = await evaluate_segment(
         settings,
@@ -831,17 +1103,42 @@ async def _amain(args: argparse.Namespace) -> None:
         settings.models.asr.model_size = args.asr_model
     if args.asr_window is not None:
         settings.models.asr.window_seconds = args.asr_window
+    if args.vlm_backend is not None:
+        settings.models.vlm.backend = args.vlm_backend
+    if args.vlm_model is not None:
+        settings.models.vlm.model = args.vlm_model
+    if args.vlm_frame_diff is not None:
+        settings.models.vlm.frame_diff_threshold = args.vlm_frame_diff
+    if args.vlm_frame_interval is not None:
+        settings.models.vlm.frame_min_interval_seconds = args.vlm_frame_interval
     # Replay speed only makes sense offline; live capture runs in real time.
     speed = args.speed if settings.platform == "file_replay" else 1.0
     capture, chat, segment = build_adapters(settings, args.segment, args.video, speed)
     controls = ControlState(settings) if args.web else None
-    monitor = _build_monitor(args, persona, settings.platform, controls)
     asr = _build_asr(settings)
+    audio_gate = _build_audio_gate(settings) if asr is not None else None
+    vlm = _build_vlm(settings)
     safety = _build_safety(settings)
     llm_backend = _build_llm_backend(settings)
     reply_generator = _build_generator(settings, llm_backend)
     summarizer = _build_summarizer(settings, llm_backend)
     fact_extractor = _build_fact_extractor(settings, llm_backend)
+
+    # Cold-start: research the channel and seed durable memory before the loop
+    # loads it. Best-effort — never let it stop the stream from starting.
+    identity: ChannelIdentity | None = None
+    profile: ChannelProfile | None = None
+    try:
+        identity, profile = await _seed_research(args, settings, llm_backend)
+    except Exception:  # noqa: BLE001 - research must not block the run
+        log.exception("research: cold-start seeding failed; continuing without it")
+    monitor = _build_monitor(
+        args,
+        persona,
+        settings.platform,
+        controls,
+        stream_info=_stream_info(args, settings, identity, profile),
+    )
     loop = BotLoop(
         settings,
         persona,
@@ -851,19 +1148,14 @@ async def _amain(args: argparse.Namespace) -> None:
         replay_speed=speed,
         monitor=monitor,
         asr=asr,
+        audio_gate=audio_gate,
+        vlm=vlm,
         reply_generator=reply_generator,
         controls=controls,
         summarizer=summarizer,
         fact_extractor=fact_extractor,
         safety=safety,
     )
-
-    # Cold-start: research the channel and seed durable memory before the loop
-    # loads it. Best-effort — never let it stop the stream from starting.
-    try:
-        await _seed_research(args, settings, llm_backend)
-    except Exception:  # noqa: BLE001 - research must not block the run
-        log.exception("research: cold-start seeding failed; continuing without it")
 
     running = asyncio.get_running_loop()
     for sig in (signal.SIGINT, signal.SIGTERM):
@@ -903,13 +1195,32 @@ def main() -> None:
     parser.add_argument(
         "--asr-model",
         default=None,
-        help="override ASR model size for this run (tiny/base/small/medium/large-v3)",
+        help="override ASR model size for this run (tiny/base/small/medium/large-v3/turbo)",
     )
     parser.add_argument(
         "--asr-window",
         type=float,
         default=None,
         help="ASR window seconds for this run (bigger = lower RTF + more context, +latency)",
+    )
+    parser.add_argument(
+        "--vlm-backend",
+        default=None,
+        choices=["none", "local_cv", "mlx_vlm"],
+        help="override video scene backend for this run",
+    )
+    parser.add_argument("--vlm-model", default=None, help="override local MLX-VLM model name")
+    parser.add_argument(
+        "--vlm-frame-diff",
+        type=float,
+        default=None,
+        help="RGB diff threshold before running local video analysis again",
+    )
+    parser.add_argument(
+        "--vlm-frame-interval",
+        type=float,
+        default=None,
+        help="minimum seconds between accepted VLM frames",
     )
     parser.add_argument("--speed", type=float, default=10.0, help="replay speed multiplier")
     parser.add_argument(

@@ -21,6 +21,8 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Protocol
 
+from pydantic import BaseModel, Field
+
 from .repetition import _tokens, jaccard, normalize  # noqa: PLC2701 (sibling helper reuse)
 
 if TYPE_CHECKING:
@@ -41,6 +43,15 @@ class SemanticFact:
 class ExtractedFact:
     text: str
     subject: str = "streamer"
+
+
+class _ExtractedFactDraft(BaseModel):
+    fact: str = ""
+    subject: str = "streamer"
+
+
+class _FactExtractionDraft(BaseModel):
+    facts: list[_ExtractedFactDraft] = Field(default_factory=list)
 
 
 class FactExtractor(Protocol):
@@ -120,7 +131,25 @@ class SemanticStore:
             data = json.loads(p.read_text())
         except (json.JSONDecodeError, OSError):
             return
-        self._facts = [SemanticFact(**f) for f in data.get("facts", [])][: self.max_facts]
+        if not isinstance(data, dict):
+            return
+        raw_facts = data.get("facts", [])
+        if not isinstance(raw_facts, list):
+            return
+        facts: list[SemanticFact] = []
+        for raw in raw_facts:
+            if not isinstance(raw, dict):
+                continue
+            try:
+                fact = SemanticFact(**raw)
+            except TypeError:
+                continue
+            if not isinstance(fact.text, str):
+                continue
+            fact.text = fact.text.strip()
+            if fact.text:
+                facts.append(fact)
+        self._facts = facts[: self.max_facts]
 
     def save_file(self, path: str) -> None:
         p = Path(path)
@@ -188,25 +217,74 @@ class LLMFactExtractor:
         system = (
             "Extract durable facts about the streamer or chat regulars from this "
             "transcript — names, places, preferences, recurring jokes. Only lasting "
-            "facts, not momentary events. Reply as a JSON array of "
-            '{"fact": str, "subject": str}. Empty array if none.'
+            "facts, not momentary events. Reply as JSON with shape "
+            '{"facts": [{"fact": str, "subject": str}]}. Empty facts if none.'
         )
+        messages = [
+            ChatTurn(role="system", content=system),
+            ChatTurn(role="user", content=transcript),
+        ]
+        structured = getattr(self._backend, "generate_structured", None)
+        if callable(structured):
+            try:
+                draft = await structured(
+                    _FactExtractionDraft,
+                    messages,
+                    max_retries=2,
+                    max_tokens=240,
+                )
+                return _facts_from_drafts(draft.facts, self.max_facts)
+            except Exception:
+                pass
         try:
-            raw = await self._backend.generate(
-                [ChatTurn(role="system", content=system), ChatTurn(role="user", content=transcript)]
-            )
-            data = json.loads(_json_slice(raw))
+            raw = await self._backend.generate(messages)
+            data = _loads_fact_payload(raw)
         except (json.JSONDecodeError, ValueError, KeyError, TypeError):
             return []
-        facts = []
-        for item in data[: self.max_facts]:
-            text = str(item.get("fact", "")).strip()
-            if text:
-                facts.append(ExtractedFact(text=text, subject=str(item.get("subject", "streamer"))))
-        return facts
+        return _facts_from_items(data, self.max_facts)
+
+
+def _facts_from_drafts(drafts: list[_ExtractedFactDraft], limit: int) -> list[ExtractedFact]:
+    facts = []
+    for item in drafts[:limit]:
+        text = item.fact.strip()
+        if text:
+            facts.append(ExtractedFact(text=text, subject=item.subject or "streamer"))
+    return facts
+
+
+def _facts_from_items(data: object, limit: int) -> list[ExtractedFact]:
+    items = data.get("facts", []) if isinstance(data, dict) else data
+    if not isinstance(items, list):
+        return []
+    facts = []
+    for item in items[:limit]:
+        if not isinstance(item, dict):
+            continue
+        text = str(item.get("fact", "")).strip()
+        if text:
+            facts.append(ExtractedFact(text=text, subject=str(item.get("subject", "streamer"))))
+    return facts
+
+
+def _loads_fact_payload(text: str) -> object:
+    obj_start = text.find("{")
+    arr_start = text.find("[")
+    if obj_start != -1 and (arr_start == -1 or obj_start < arr_start):
+        obj = _json_object(text)
+        data = json.loads(obj)
+        if isinstance(data, dict) and "facts" in data:
+            return data
+    return json.loads(_json_slice(text))
 
 
 def _json_slice(text: str) -> str:
     """Best-effort: pull the JSON array out of a chatty LLM response."""
     start, end = text.find("["), text.rfind("]")
     return text[start : end + 1] if start != -1 and end > start else "[]"
+
+
+def _json_object(text: str) -> str:
+    """Best-effort: pull the JSON object out of a chatty LLM response."""
+    start, end = text.find("{"), text.rfind("}")
+    return text[start : end + 1] if start != -1 and end > start else "{}"

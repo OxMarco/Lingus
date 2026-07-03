@@ -19,6 +19,8 @@ import json
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
+from pydantic import BaseModel, Field
+
 from ..logging import get_logger
 from .identity import ChannelIdentity
 from .search import SearchResult, WebSearchBackend
@@ -38,6 +40,11 @@ class ChannelProfile:
     facts: list[str] = field(default_factory=list)
     summary: str = ""
     source_urls: list[str] = field(default_factory=list)
+
+
+class _ChannelProfileDraft(BaseModel):
+    facts: list[str] = Field(default_factory=list)
+    summary: str = ""
 
 
 def _search_queries(identity: ChannelIdentity, limit: int) -> list[str]:
@@ -111,14 +118,28 @@ class ChannelResearcher:
             "web snippets, extract lasting facts — real name/handle, where they're "
             "from, what they stream, their persona, recurring bits, catchphrases, "
             "notable community in-jokes. Only durable facts, not momentary events, "
-            "and do not invent anything unsupported by the material. Reply as JSON: "
+            "and do not invent anything unsupported by the material. Reply as JSON with shape: "
             '{"facts": [str, ...], "summary": str}. Each fact one short sentence. '
             f"At most {self.max_facts} facts. Empty facts list if the material is too thin."
         )
+        messages = [
+            ChatTurn(role="system", content=system),
+            ChatTurn(role="user", content=material),
+        ]
+        structured = getattr(self._llm, "generate_structured", None)
+        if callable(structured):
+            try:
+                draft = await structured(
+                    _ChannelProfileDraft,
+                    messages,
+                    max_retries=2,
+                    max_tokens=600,
+                )
+                return self._profile_from_draft(identity, hits, draft)
+            except Exception as exc:
+                log.warning("research: structured LLM distillation failed (%s)", exc)
         try:
-            raw = await self._llm.generate(  # type: ignore[union-attr]
-                [ChatTurn(role="system", content=system), ChatTurn(role="user", content=material)]
-            )
+            raw = await self._llm.generate(messages)  # type: ignore[union-attr]
             data = json.loads(_json_object(raw))
         except Exception as exc:  # noqa: BLE001 - any LLM/parse failure → fallback
             log.warning("research: LLM distillation failed (%s)", exc)
@@ -128,6 +149,20 @@ class ChannelResearcher:
             channel=identity.name,
             facts=facts[: self.max_facts],
             summary=str(data.get("summary", "")).strip(),
+            source_urls=[h.url for h in hits if h.url],
+        )
+
+    def _profile_from_draft(
+        self,
+        identity: ChannelIdentity,
+        hits: list[SearchResult],
+        draft: _ChannelProfileDraft,
+    ) -> ChannelProfile:
+        facts = [str(f).strip() for f in draft.facts if str(f).strip()]
+        return ChannelProfile(
+            channel=identity.name,
+            facts=facts[: self.max_facts],
+            summary=draft.summary.strip(),
             source_urls=[h.url for h in hits if h.url],
         )
 

@@ -2,7 +2,7 @@
 
 import asyncio
 
-from lingus.memory import HeuristicFactExtractor, SemanticStore
+from lingus.memory import HeuristicFactExtractor, LLMFactExtractor, SemanticStore
 
 
 def test_add_and_dedup_reworded_fact():
@@ -58,6 +58,28 @@ def test_load_missing_file_is_noop(tmp_path):
     assert len(s) == 0
 
 
+def test_load_malformed_fact_entries_skips_bad_rows(tmp_path):
+    path = tmp_path / "sem.json"
+    path.write_text(
+        """
+        {
+          "facts": [
+            "not an object",
+            {"text": 123},
+            {"text": "the streamer likes jazz", "subject": "streamer"},
+            {"text": "bad", "unexpected": true}
+          ]
+        }
+        """,
+        encoding="utf-8",
+    )
+    s = SemanticStore()
+
+    s.load_file(str(path))
+
+    assert s.texts() == ["the streamer likes jazz"]
+
+
 def test_heuristic_extractor_pulls_durable_first_person_facts():
     ex = HeuristicFactExtractor()
     lines = [
@@ -73,3 +95,28 @@ def test_heuristic_extractor_pulls_durable_first_person_facts():
     assert any("coffee" in f for f in facts)
     assert any("jazz" in f for f in facts)
     assert not any("whatever" in f for f in facts)
+
+
+def test_llm_extractor_accepts_legacy_json_array():
+    class FakeLLM:
+        async def generate(self, messages, **opts):
+            return '[{"fact": "the streamer likes jazz", "subject": "streamer"}]'
+
+    facts = asyncio.run(LLMFactExtractor(FakeLLM()).extract(["I love jazz"]))
+
+    assert [(f.text, f.subject) for f in facts] == [("the streamer likes jazz", "streamer")]
+
+
+def test_llm_extractor_prefers_structured_backend():
+    class FakeStructuredLLM:
+        async def generate_structured(self, response_model, messages, **opts):
+            return response_model(
+                facts=[{"fact": "chat regular sam is from Malta", "subject": "sam"}]
+            )
+
+        async def generate(self, messages, **opts):  # pragma: no cover - should not run
+            raise AssertionError("raw JSON fallback should not be used")
+
+    facts = asyncio.run(LLMFactExtractor(FakeStructuredLLM()).extract(["Sam is from Malta"]))
+
+    assert [(f.text, f.subject) for f in facts] == [("chat regular sam is from Malta", "sam")]

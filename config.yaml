@@ -17,10 +17,25 @@ youtube:
 models:
   asr:
     backend: faster_whisper
-    model_size: medium     # tiny|base|small|medium|large-v3 (medium ≈0.48x RTF at 10s window)
+    model_size: turbo      # tiny|base|small|medium|large-v3|turbo (turbo = large-v3-turbo)
     device: auto           # auto|cpu|metal
     language: en           # pin language (null = autodetect per window)
-    window_seconds: 10     # ASR window; 10s lets medium/turbo keep up on CPU (+5s latency)
+    window_seconds: 10     # ASR window; 10s lets turbo keep up locally (+5s latency)
+  audio_gate:
+    # Pre-ASR speech/music gate. Music-only windows are replaced with a short
+    # silence marker so Whisper gets pause timing without song lyrics poisoning
+    # transcript context. "hf_ast" uses the locally cached Hugging Face AudioSet
+    # classifier; "spectral" is dependency-light; "none" disables the gate.
+    backend: spectral
+    window_seconds: 2.0
+    speech_threshold: 0.45
+    music_threshold: 0.65
+    silence_rms: 0.003
+    replacement_silence_seconds: 0.5
+    hf_model: MIT/ast-finetuned-audioset-10-10-0.4593
+    hf_top_k: 12
+    hf_cache_dir: .lingus/hf/hub
+    hf_local_files_only: true
   llm:
     # Provider = backend + .env base_url/api_key + the `model` below, together.
     # `openai_compat` talks to any OpenAI-compatible endpoint. Presets:
@@ -32,9 +47,23 @@ models:
     backend: openai_compat
     model: gpt-5.5
     temperature: 0.9
-    max_tokens: 120
+    max_tokens: 180
   vlm:
-    backend: none          # enabled in Phase 4
+    # Local-only scene-state analysis for Phase 4. No frames are sent to a hosted
+    # vision model; remote LLM use stays limited to summarization and bot replies.
+    # On this M4 Max / 64 GB machine, use the 3B MLX-VLM for live latency.
+    # Override --vlm-model mlx-community/Qwen2.5-VL-7B-Instruct-4bit for
+    # slower, higher-detail offline checks.
+    backend: mlx_vlm        # mlx_vlm|local_cv|none
+    model: mlx-community/Qwen2.5-VL-3B-Instruct-4bit
+    max_tokens: 120
+    temperature: 0.0
+    fallback_to_local_cv: true
+    frame_diff_threshold: 0.08      # RGB diff needed before analyzing again
+    frame_min_interval_seconds: 3.0 # minimum spacing between accepted frames
+    max_sample_pixels: 4096         # sampled pixels per analyzed frame
+    brightness_change_threshold: 0.16
+    contrast_change_threshold: 0.10
   moderation:
     # Safety gate before every post (see lingus/safety.py). "regex" = the
     # deterministic denylist (hate slurs, threats, CSAE, doxxing, spam);
@@ -90,6 +119,9 @@ memory:
   episodic_enabled: true
   episodic_batch_lines: 8    # fold the "stream so far" digest once this many lines age out
   episodic_max_chars: 800    # cap on the running narrative
+  episodic_path: .lingus/episodes.json
+  episodic_max_entries: 20   # compact per-stream summaries to keep across runs
+  episodic_top_k: 3          # prior stream summaries surfaced into context
   semantic_enabled: true     # durable facts persisted across streams
   semantic_path: .lingus/semantic.json
   semantic_max_facts: 50
@@ -122,7 +154,8 @@ output:
   posts_per_minute: 6.0          # token-bucket sustained rate
   burst: 2                       # token-bucket capacity (how many may bunch up)
   regenerate_on_overflow: true   # try one tighter reply before truncating
-  # Temporizer: emulate human typing time so a sentence can't land instantly.
+  # Optional flavor delay. Keep disabled live so replies are not artificially held.
+  typing_enabled: false
   typing_cps: 15.0               # characters "typed" per second
   typing_base_seconds: 0.4       # reaction beat before typing starts
   typing_min_seconds: 0.8        # a one-word reaction still feels deliberate

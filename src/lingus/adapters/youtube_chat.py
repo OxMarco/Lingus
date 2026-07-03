@@ -26,6 +26,7 @@ from dataclasses import dataclass
 from typing import Any
 
 import aiohttp
+from tenacity import AsyncRetrying, retry_if_exception, stop_after_attempt, wait_exponential
 
 from ..logging import get_logger
 from .base import ChatMessage
@@ -53,6 +54,12 @@ _HEADERS = {
 }
 
 _API_KEY_RE = re.compile(r'"INNERTUBE_API_KEY"\s*:\s*"([^"]+)"')
+
+
+def _is_transient_http_error(exc: BaseException) -> bool:
+    if isinstance(exc, aiohttp.ClientResponseError):
+        return not (400 <= exc.status < 500)
+    return isinstance(exc, aiohttp.ClientError | TimeoutError)
 
 
 class YouTubeLiveChatError(RuntimeError):
@@ -366,19 +373,35 @@ class YouTubeLiveChatClient:
     async def _retry(self, op):
         """Run one HTTP op with exponential backoff on transient failures.
         Client errors (4xx) are protocol problems, not weather — fail fast."""
-        delay = 1.0
-        for attempt in range(1, self._max_retries + 1):
-            try:
-                return await op()
-            except (aiohttp.ClientError, TimeoutError) as exc:
-                status = getattr(exc, "status", None)
-                if status is not None and 400 <= status < 500:
-                    raise YouTubeLiveChatError(f"chat request rejected ({status})") from exc
-                if attempt == self._max_retries:
-                    raise YouTubeLiveChatError(
-                        f"chat request failed after {attempt} attempts: {exc}"
-                    ) from exc
-                log.debug("chat request failed (attempt %d): %s; retrying", attempt, exc)
-                await asyncio.sleep(delay)
-                delay = min(delay * 2, 16.0)
+        retryer = AsyncRetrying(
+            retry=retry_if_exception(_is_transient_http_error),
+            stop=stop_after_attempt(self._max_retries),
+            wait=wait_exponential(multiplier=1, min=1, max=16),
+            reraise=True,
+            before_sleep=_log_retry,
+        )
+        try:
+            async for attempt in retryer:
+                with attempt:
+                    return await op()
+        except aiohttp.ClientResponseError as exc:
+            if 400 <= exc.status < 500:
+                raise YouTubeLiveChatError(f"chat request rejected ({exc.status})") from exc
+            raise YouTubeLiveChatError(
+                f"chat request failed after {self._max_retries} attempts: {exc}"
+            ) from exc
+        except (aiohttp.ClientError, TimeoutError) as exc:
+            raise YouTubeLiveChatError(
+                f"chat request failed after {self._max_retries} attempts: {exc}"
+            ) from exc
         raise AssertionError("unreachable")  # pragma: no cover
+
+
+def _log_retry(retry_state) -> None:
+    exc = retry_state.outcome.exception() if retry_state.outcome is not None else None
+    if exc is not None:
+        log.debug(
+            "chat request failed (attempt %d): %s; retrying",
+            retry_state.attempt_number,
+            exc,
+        )

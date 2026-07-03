@@ -8,7 +8,7 @@ no acceptable rate at which the bot floods chat, and no acceptable length past
 the cap. So they are enforced here, in code, where no model decision can talk
 its way past them.
 
-Three responsibilities, all deterministic and time-injectable for tests:
+Two responsibilities, deterministic and time-injectable for tests:
 
   * **rate** — a token bucket (sustained + burst ceiling) plus a hard minimum
     spacing between posts. This is the authority; the arbiter's matching
@@ -16,14 +16,13 @@ Three responsibilities, all deterministic and time-injectable for tests:
   * **length** — a hard character cap with *sentence-aware* truncation, so an
     over-long reply is cut at a sentence (or at worst a word) boundary with an
     ellipsis — never mid-word, never over the cap.
-  * **temporizer** — a human-like "typing time" derived from the message
-    length, so a full sentence can't land instantly on the heels of the prior
-    message. The caller awaits this delay before posting (and re-checks
-    staleness afterwards, since the world moves while the bot "types").
+
+An optional typing delay remains as a flavor knob, but it is disabled by
+default for live responsiveness.
 
 `admit()` both checks the rate limit and *commits* (consumes a token, stamps the
 post time) when it returns `post` — so call it only when you actually intend to
-post, after the staleness re-check.
+post.
 """
 
 from __future__ import annotations
@@ -78,6 +77,7 @@ class OutputGovernor:
         min_seconds_between_posts: float,
         burst: int = 2,
         posts_per_minute: float = 6.0,
+        typing_enabled: bool = False,
         typing_cps: float = 15.0,
         typing_base_seconds: float = 0.4,
         typing_min_seconds: float = 0.8,
@@ -86,6 +86,7 @@ class OutputGovernor:
     ) -> None:
         self.max_chars = max_chars
         self.min_interval = min_seconds_between_posts
+        self.typing_enabled = typing_enabled
         self.typing_cps = typing_cps
         self.typing_base_seconds = typing_base_seconds
         self.typing_min_seconds = typing_min_seconds
@@ -133,12 +134,14 @@ class OutputGovernor:
 
     # --- temporizer (human-like typing time) ---
     def typing_delay(self, text: str) -> float:
-        """Seconds a human would plausibly take to type `text`.
+        """Optional seconds a human would plausibly take to type `text`.
 
         A base reaction beat plus per-character time, clamped so a one-word
         reaction still feels deliberate and a long one doesn't stall forever.
-        The caller awaits this before posting (scaling by replay speed offline).
+        Disabled by default so live replies are not artificially delayed.
         """
+        if not self.typing_enabled:
+            return 0.0
         raw = self.typing_base_seconds + len(text.strip()) / self.typing_cps
         return max(self.typing_min_seconds, min(self.typing_max_seconds, raw))
 

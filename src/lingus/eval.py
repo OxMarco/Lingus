@@ -28,6 +28,8 @@ from collections.abc import Sequence
 from dataclasses import asdict, dataclass, field
 from typing import TYPE_CHECKING, Protocol
 
+from pydantic import BaseModel, Field
+
 from .memory.repetition import jaccard, normalize
 from .models.base import ChatTurn, LLMBackend
 from .monitor import TickReport
@@ -128,6 +130,13 @@ class Score:
     @property
     def overall(self) -> float:
         return (self.in_character + self.not_generic + self.not_repetitive) / 3.0
+
+
+class _ScoreDraft(BaseModel):
+    in_character: int = Field(ge=1, le=10)
+    not_generic: int = Field(ge=1, le=10)
+    not_repetitive: int = Field(ge=1, le=10)
+    note: str = ""
 
 
 @dataclass(slots=True)
@@ -342,15 +351,31 @@ class LLMJudge:
             f"ITS OTHER LINES THIS RUN:\n{peer_block}\n"
             "Grade it."
         )
+        messages = [ChatTurn("system", system), ChatTurn("user", user)]
         try:
-            raw = await self._backend.generate(
-                [ChatTurn("system", system), ChatTurn("user", user)],
-                temperature=0.0,
-                max_tokens=120,
-            )
+            structured = getattr(self._backend, "generate_structured", None)
+            if callable(structured):
+                draft = await structured(
+                    _ScoreDraft,
+                    messages,
+                    temperature=0.0,
+                    max_tokens=120,
+                    max_retries=2,
+                )
+                return _score_from_draft(draft)
+            raw = await self._backend.generate(messages, temperature=0.0, max_tokens=120)
             return _parse_llm_score(raw)
         except Exception:
             return await self._fallback.score(sample, persona, peers)
+
+
+def _score_from_draft(data: _ScoreDraft) -> Score:
+    return Score(
+        in_character=(data.in_character - 1.0) / 9.0,
+        not_generic=(data.not_generic - 1.0) / 9.0,
+        not_repetitive=(data.not_repetitive - 1.0) / 9.0,
+        notes=data.note,
+    )
 
 
 def _parse_llm_score(raw: str) -> Score:

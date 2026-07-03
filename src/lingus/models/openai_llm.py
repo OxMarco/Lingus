@@ -10,6 +10,8 @@ OutputGovernor — this layer only *aims* for brevity.
 
 from __future__ import annotations
 
+from typing import Any, TypeVar
+
 from ..arbiter import ArbiterDecision
 from ..context import ContextSnapshot
 from ..logging import get_logger
@@ -17,6 +19,11 @@ from ..persona.schema import PersonaSpec
 from .base import ChatTurn, LLMBackend
 
 log = get_logger(__name__)
+T = TypeVar("T")
+
+
+def _message_dicts(messages: list[ChatTurn]) -> list[dict[str, str]]:
+    return [{"role": m.role, "content": m.content} for m in messages]
 
 
 class OpenAICompatLLM(LLMBackend):
@@ -32,6 +39,7 @@ class OpenAICompatLLM(LLMBackend):
         from openai import AsyncOpenAI
 
         self._client = AsyncOpenAI(api_key=api_key, base_url=base_url or None)
+        self._structured_client: Any | None = None
         self._model = model
         self._temperature = temperature
         self._max_tokens = max_tokens
@@ -42,11 +50,35 @@ class OpenAICompatLLM(LLMBackend):
     async def generate(self, messages: list[ChatTurn], **opts) -> str:
         resp = await self._client.chat.completions.create(
             model=opts.get("model", self._model),
-            messages=[{"role": m.role, "content": m.content} for m in messages],
+            messages=_message_dicts(messages),
             temperature=opts.get("temperature", self._temperature),
             max_tokens=opts.get("max_tokens", self._max_tokens),
         )
         return (resp.choices[0].message.content or "").strip()
+
+    async def generate_structured(
+        self,
+        response_model: type[T],
+        messages: list[ChatTurn],
+        **opts,
+    ) -> T:
+        """Generate and validate structured output via Instructor."""
+
+        import instructor
+
+        if self._structured_client is None:
+            self._structured_client = instructor.from_openai(self._client)
+        request = dict(opts)
+        max_retries = request.pop("max_retries", 3)
+        return await self._structured_client.create(
+            response_model=response_model,
+            messages=_message_dicts(messages),
+            model=request.pop("model", self._model),
+            temperature=request.pop("temperature", self._temperature),
+            max_tokens=request.pop("max_tokens", self._max_tokens),
+            max_retries=max_retries,
+            **request,
+        )
 
 
 def build_system_prompt(persona: PersonaSpec, max_chars: int) -> str:

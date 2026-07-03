@@ -39,6 +39,7 @@ class WebMonitor:
         persona_name: str,
         platform: str,
         *,
+        stream_info: dict[str, object] | None = None,
         host: str = "127.0.0.1",
         port: int = 8080,
         history: int = 60,
@@ -46,12 +47,14 @@ class WebMonitor:
         self.controls = controls
         self.persona_name = persona_name
         self.platform = platform
+        self.stream_info = stream_info or {}
         self.host = host
         self.port = port
         self._clients: set[web.WebSocketResponse] = set()
         self._messages: deque[dict[str, Any]] = deque(maxlen=history)
         self._latest_tick: dict[str, Any] | None = None
         self._serve_task: asyncio.Task[None] | None = None
+        self._serve_error: BaseException | None = None
         self._runner: web.AppRunner | None = None
         self._start_t: float | None = None
         self._tick_no = 0
@@ -59,13 +62,37 @@ class WebMonitor:
     # --- Monitor protocol ---
     def start(self) -> None:
         # Called from within the running loop; spin the server up as a task.
+        self._serve_error = None
         self._serve_task = asyncio.create_task(self._serve(), name="webui")
+        self._serve_task.add_done_callback(self._remember_serve_failure)
 
     def stop(self) -> None:
         if self._serve_task is not None:
             self._serve_task.cancel()
 
+    async def wait_stopped(self) -> None:
+        if self._serve_task is None:
+            return
+        try:
+            await self._serve_task
+        except asyncio.CancelledError:
+            pass
+        except Exception as exc:
+            # The done callback normally logs and stores this first; keep cleanup
+            # idempotent if the await wins the race.
+            if self._serve_error is None:
+                self._serve_error = exc
+                log.error("web UI server failed", exc_info=(type(exc), exc, exc.__traceback__))
+
     def on_tick(self, report: TickReport) -> None:
+        if (
+            self._serve_task is not None
+            and self._serve_task.done()
+            and self._serve_error is None
+        ):
+            self._remember_serve_failure(self._serve_task)
+        if self._serve_error is not None:
+            raise RuntimeError("web UI server failed") from self._serve_error
         if self._start_t is None:
             self._start_t = report.t
         self._tick_no += 1
@@ -80,6 +107,17 @@ class WebMonitor:
                 {"kind": "dropped", "text": report.dropped, "clock": payload["clock"]}
             )
         self._broadcast({"type": "tick", **payload})
+
+    def _remember_serve_failure(self, task: asyncio.Task[None]) -> None:
+        if task.cancelled():
+            return
+        if self._serve_error is not None:
+            return
+        exc = task.exception()
+        if exc is None:
+            return
+        self._serve_error = exc
+        log.error("web UI server failed", exc_info=(type(exc), exc, exc.__traceback__))
 
     # --- payload builders ---
     def _tick_payload(self, report: TickReport) -> dict[str, Any]:
@@ -98,6 +136,9 @@ class WebMonitor:
             "scene": report.scene_summary,
             "transcript": report.transcript_tail,
             "chat": [{"author": c.author, "text": c.text} for c in report.recent_chat],
+            "episodic_summary": report.episodic_summary,
+            "episodic_history": list(report.episodic_history),
+            "semantic_facts": list(report.semantic_facts),
             "posted": report.posted,
             "dropped": report.dropped,
         }
@@ -107,6 +148,7 @@ class WebMonitor:
             "type": "init",
             "persona": self.persona_name,
             "platform": self.platform,
+            "stream": self.stream_info,
             "schema": self.controls.schema(),
             "controls": self.controls.values(),
             "messages": list(self._messages),
@@ -202,10 +244,39 @@ _INDEX_HTML = r"""<!doctype html>
   #conn { margin-left:auto; font-size:12px; }
   #conn.up { color:var(--green); } #conn.down { color:var(--red); }
   main { display:grid; grid-template-columns:320px 1fr; gap:14px; padding:14px 18px; align-items:start; }
-  .panel { background:var(--panel); border:1px solid var(--line); border-radius:10px; padding:14px; }
+  .panel { background:var(--panel); border:1px solid var(--line); border-radius:8px; padding:14px; }
   .panel h2 { margin:0 0 10px; font-size:12px; letter-spacing:.08em; text-transform:uppercase; color:var(--dim); }
   .grid2 { display:grid; grid-template-columns:1fr 1fr; gap:14px; }
   @media (max-width:900px){ main{grid-template-columns:1fr;} .grid2{grid-template-columns:1fr;} }
+
+  .fab { position:fixed; left:18px; bottom:18px; z-index:30; width:52px; height:52px;
+    border-radius:50%; border:1px solid #6f55b6; background:var(--accent); color:#140d20;
+    font-weight:900; font-size:22px; cursor:pointer; box-shadow:0 14px 32px rgba(0,0,0,.45); }
+  .scrim { position:fixed; inset:0; z-index:40; background:rgba(0,0,0,.52); opacity:0;
+    pointer-events:none; transition:opacity .18s; }
+  .scrim.open { opacity:1; pointer-events:auto; }
+  .sheet { position:fixed; z-index:50; inset:0 auto 0 0; width:min(420px, 92vw);
+    background:var(--panel); border-right:1px solid var(--line);
+    transform:translateX(-104%); transition:transform .2s ease; padding:16px;
+    overflow:auto; box-shadow:18px 0 48px rgba(0,0,0,.45); }
+  .sheet.open { transform:translateX(0); }
+  .sheet-head { display:flex; align-items:center; justify-content:space-between; margin-bottom:12px; }
+  .sheet-head h2 { margin:0; font-size:12px; letter-spacing:.08em; text-transform:uppercase; color:var(--dim); }
+  .icon-btn { width:34px; height:34px; border-radius:8px; border:1px solid var(--line);
+    background:var(--panel2); color:var(--ink); cursor:pointer; font-size:20px; line-height:1; }
+
+  .profile-name { font-size:22px; font-weight:800; color:var(--ink); margin-bottom:10px; overflow-wrap:anywhere; }
+  .profile-meta { display:grid; grid-template-columns:84px 1fr; gap:6px 10px; margin-bottom:16px; }
+  .profile-meta .k, .research .k { color:var(--dim); font-size:11px; text-transform:uppercase; letter-spacing:.06em; }
+  .profile-meta .v { min-width:0; overflow-wrap:anywhere; }
+  .profile-meta a { color:var(--blue); text-decoration:none; }
+  .profile-meta a:hover { text-decoration:underline; }
+  .research .summary { color:var(--ink); white-space:pre-wrap; overflow-wrap:anywhere; margin-bottom:10px; }
+  .research ul { margin:0 0 12px 0; padding-left:18px; color:var(--ink); }
+  .research li { margin-bottom:6px; }
+  .sources { display:flex; flex-wrap:wrap; gap:6px; }
+  .sources a { max-width:100%; color:var(--dim); background:var(--panel2); border:1px solid var(--line);
+    border-radius:8px; padding:3px 7px; text-decoration:none; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
 
   /* toggle */
   .toggle { display:flex; align-items:center; gap:10px; margin-bottom:14px; }
@@ -242,6 +313,8 @@ _INDEX_HTML = r"""<!doctype html>
 
   .ctx .k { color:var(--dim); font-size:11px; text-transform:uppercase; letter-spacing:.06em; }
   .ctx .v { margin:4px 0 12px; white-space:pre-wrap; word-break:break-word; }
+  .memlist { margin:4px 0 12px; padding-left:18px; color:var(--ink); }
+  .memlist li { margin-bottom:6px; overflow-wrap:anywhere; }
   .chatline b { color:var(--blue); }
 
   #log { max-height:340px; overflow:auto; }
@@ -259,16 +332,37 @@ _INDEX_HTML = r"""<!doctype html>
   <span class="dim" id="uptime"></span>
   <span id="conn" class="down">● connecting…</span>
 </header>
-<main>
-  <!-- LEFT: controls -->
-  <section class="panel" id="controls">
+<button class="fab" id="controlsFab" aria-label="open controls" title="Controls">☰</button>
+<div class="scrim" id="sheetScrim"></div>
+<aside class="sheet" id="controlSheet" aria-hidden="true">
+  <div class="sheet-head">
     <h2>controls</h2>
-    <div class="toggle">
-      <button id="chatBtn" aria-label="toggle chat"><span class="knob"></span></button>
-      <span class="label" id="chatLabel">chatting…</span>
+    <button class="icon-btn" id="closeSheet" aria-label="close controls">×</button>
+  </div>
+  <div class="toggle">
+    <button id="chatBtn" aria-label="toggle chat"><span class="knob"></span></button>
+    <span class="label" id="chatLabel">chatting…</span>
+  </div>
+  <div id="params"></div>
+  <div class="deriv" id="deriv"></div>
+</aside>
+<main>
+  <!-- LEFT: stream profile -->
+  <section class="panel stream-profile">
+    <h2>stream</h2>
+    <div class="profile-name" id="streamer">—</div>
+    <div class="profile-meta">
+      <div class="k">platform</div><div class="v" id="streamPlatform">—</div>
+      <div class="k">live</div><div class="v"><a id="liveLink" target="_blank" rel="noopener">—</a></div>
     </div>
-    <div id="params"></div>
-    <div class="deriv" id="deriv"></div>
+    <div class="research">
+      <h2>web search context</h2>
+      <div class="summary" id="researchSummary">—</div>
+      <div class="k">facts</div>
+      <ul id="researchFacts"><li>—</li></ul>
+      <div class="k">sources</div>
+      <div class="sources" id="researchSources">—</div>
+    </div>
   </section>
 
   <!-- RIGHT: live view -->
@@ -292,6 +386,9 @@ _INDEX_HTML = r"""<!doctype html>
         <div class="k">scene</div><div class="v" id="scene">—</div>
         <div class="k">speech (asr)</div><div class="v" id="speech">—</div>
         <div class="k">chat</div><div class="v" id="chat">—</div>
+        <div class="k">stream so far</div><div class="v" id="episodicSummary">—</div>
+        <div class="k">past stream memories</div><ul class="memlist" id="episodicHistory"><li>—</li></ul>
+        <div class="k">known facts</div><ul class="memlist" id="semanticFacts"><li>—</li></ul>
       </section>
       <section class="panel">
         <h2>bot messages</h2>
@@ -303,7 +400,7 @@ _INDEX_HTML = r"""<!doctype html>
 
 <script>
 const $ = (id) => document.getElementById(id);
-let ws, schema = [], controls = {};
+let ws, schema = [], controls = {}, stream = {};
 
 function connect() {
   ws = new WebSocket(`ws://${location.host}/ws`);
@@ -319,6 +416,8 @@ function handle(m) {
   if (m.type === "init") {
     $("persona").textContent = m.persona;
     $("platform").textContent = "· " + m.platform;
+    stream = m.stream || {};
+    renderStream();
     schema = m.schema; controls = m.controls;
     buildParams();
     renderControls();
@@ -335,7 +434,7 @@ function buildParams() {
   const box = $("params"); box.innerHTML = "";
   for (const s of schema) {
     if (s.kind === "bool") {
-      if (s.key === "chat_enabled") continue; // master switch lives in the header
+      if (s.key === "chat_enabled") continue; // master switch lives at the top of the sheet
       const wrap = document.createElement("div"); wrap.className = "toggle";
       wrap.innerHTML = `<button id="b_${s.key}" aria-label="toggle ${s.key}"><span class="knob"></span></button>
         <span class="label" id="l_${s.key}">${s.label}</span>`;
@@ -359,6 +458,47 @@ function buildParams() {
 }
 
 function fmt(s, v) { return s.kind === "int" ? String(Math.round(v)) : (+v).toFixed(2); }
+
+function titleCase(s) {
+  s = s == null ? "" : String(s);
+  return s ? s.charAt(0).toUpperCase() + s.slice(1) : "—";
+}
+
+function hostLabel(url) {
+  try { return new URL(url).hostname.replace(/^www\./, ""); }
+  catch { return url || "—"; }
+}
+
+function safeHref(url) {
+  try {
+    const parsed = new URL(url, location.href);
+    return ["http:", "https:"].includes(parsed.protocol) ? parsed.href : "";
+  } catch { return ""; }
+}
+
+function renderStream() {
+  $("streamer").textContent = stream.nickname || "unknown streamer";
+  $("streamPlatform").textContent = titleCase(stream.platform);
+  const live = $("liveLink");
+  const liveHref = safeHref(stream.live_url);
+  if (liveHref) {
+    live.href = liveHref;
+    live.textContent = hostLabel(liveHref);
+  } else {
+    live.removeAttribute("href");
+    live.textContent = "—";
+  }
+  $("researchSummary").textContent = stream.summary || "—";
+  const facts = Array.isArray(stream.facts) ? stream.facts : [];
+  $("researchFacts").innerHTML = facts.length
+    ? facts.map(f => `<li>${esc(f)}</li>`).join("")
+    : "<li>—</li>";
+  const sources = Array.isArray(stream.source_urls) ? stream.source_urls : [];
+  const sourceLinks = sources.map((u, i) => ({ href: safeHref(u), i })).filter(s => s.href);
+  $("researchSources").innerHTML = sourceLinks.length
+    ? sourceLinks.map(s => `<a href="${escAttr(s.href)}" target="_blank" rel="noopener">source ${s.i + 1}</a>`).join("")
+    : "—";
+}
 
 function renderControls() {
   for (const s of schema) {
@@ -408,6 +548,14 @@ function renderTick(t) {
   $("chat").innerHTML = t.chat && t.chat.length
     ? t.chat.map(c => `<div class="chatline"><b>${esc(c.author)}:</b> ${esc(c.text)}</div>`).join("")
     : "—";
+  $("episodicSummary").textContent = t.episodic_summary || "—";
+  renderList("episodicHistory", t.episodic_history);
+  renderList("semanticFacts", t.semantic_facts);
+}
+
+function renderList(id, items) {
+  const list = Array.isArray(items) ? items : [];
+  $(id).innerHTML = list.length ? list.map(item => `<li>${esc(item)}</li>`).join("") : "<li>—</li>";
 }
 
 function pushMessage(t) {
@@ -427,6 +575,16 @@ function renderMessages(list, prepend) {
 }
 
 function esc(s){ return (s==null?"":String(s)).replace(/[&<>]/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;"}[c])); }
+function escAttr(s){ return esc(s).replace(/"/g, "&quot;"); }
+function setSheet(open) {
+  $("controlSheet").classList.toggle("open", open);
+  $("sheetScrim").classList.toggle("open", open);
+  $("controlSheet").setAttribute("aria-hidden", open ? "false" : "true");
+}
+$("controlsFab").onclick = () => setSheet(true);
+$("closeSheet").onclick = () => setSheet(false);
+$("sheetScrim").onclick = () => setSheet(false);
+document.addEventListener("keydown", (ev) => { if (ev.key === "Escape") setSheet(false); });
 connect();
 </script>
 </body>

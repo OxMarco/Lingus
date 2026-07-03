@@ -14,7 +14,13 @@ Two summarizers behind one protocol, mirroring the generator:
 
 from __future__ import annotations
 
+import json
+import time
+from dataclasses import asdict, dataclass
+from pathlib import Path
 from typing import TYPE_CHECKING, Protocol
+
+from .repetition import _tokens, jaccard  # noqa: PLC2701 (sibling helper reuse)
 
 if TYPE_CHECKING:
     from ..models.base import LLMBackend
@@ -24,6 +30,136 @@ class EpisodicSummarizer(Protocol):
     async def summarize(self, prior: str, new_lines: list[str]) -> str:
         """Fold `new_lines` into `prior`, returning the updated narrative."""
         ...
+
+
+@dataclass(slots=True)
+class EpisodicMemory:
+    summary: str
+    stream_id: str
+    kind: str = "stream_summary"
+    source: str = "stream"
+    created_ts: float = 0.0
+    updated_ts: float = 0.0
+    last_seen_ts: float = 0.0
+    hits: int = 0
+
+
+class EpisodicArchive:
+    """Durable per-stream summaries.
+
+    Short-term memory stays in `WorldState`; this archive stores compact stream
+    summaries across runs so the bot can make callbacks without carrying raw
+    transcripts or introducing a vector DB.
+    """
+
+    def __init__(self, *, max_entries: int = 20) -> None:
+        self.max_entries = max_entries
+        self._episodes: list[EpisodicMemory] = []
+
+    def __len__(self) -> int:
+        return len(self._episodes)
+
+    def add(
+        self,
+        summary: str,
+        *,
+        stream_id: str,
+        source: str = "stream",
+        now: float | None = None,
+    ) -> EpisodicMemory | None:
+        summary = summary.strip()
+        stream_id = stream_id.strip() or "unknown-stream"
+        if not summary:
+            return None
+        current = time.time() if now is None else now
+        for episode in self._episodes:
+            if episode.stream_id == stream_id:
+                episode.summary = summary
+                episode.source = source
+                episode.updated_ts = current
+                episode.last_seen_ts = current
+                self._evict()
+                return episode
+        episode = EpisodicMemory(
+            summary=summary,
+            stream_id=stream_id,
+            source=source,
+            created_ts=current,
+            updated_ts=current,
+            last_seen_ts=current,
+        )
+        self._episodes.append(episode)
+        self._evict()
+        return episode
+
+    def retrieve(
+        self,
+        query: str,
+        k: int = 3,
+        *,
+        now: float | None = None,
+    ) -> list[EpisodicMemory]:
+        """Top-k summaries by token overlap, then prior usefulness and recency."""
+        if not self._episodes or k <= 0:
+            return []
+        qt = _tokens(query)
+        ranked = sorted(
+            self._episodes,
+            key=lambda e: (jaccard(qt, _tokens(e.summary)), e.hits, e.updated_ts),
+            reverse=True,
+        )
+        current = time.time() if now is None else now
+        top = ranked[:k]
+        for episode in top:
+            episode.hits += 1
+            episode.last_seen_ts = current
+        return top
+
+    def summaries(self) -> list[str]:
+        return [episode.summary for episode in self._episodes]
+
+    def _evict(self) -> None:
+        if len(self._episodes) <= self.max_entries:
+            return
+        self._episodes.sort(key=lambda e: (e.hits, e.updated_ts))
+        self._episodes = self._episodes[len(self._episodes) - self.max_entries :]
+
+    def load_file(self, path: str) -> None:
+        p = Path(path)
+        if not p.exists():
+            return
+        try:
+            data = json.loads(p.read_text())
+        except (json.JSONDecodeError, OSError):
+            return
+        if not isinstance(data, dict):
+            return
+        raw_episodes = data.get("episodes", [])
+        if not isinstance(raw_episodes, list):
+            return
+        episodes: list[EpisodicMemory] = []
+        for raw in raw_episodes:
+            if not isinstance(raw, dict):
+                continue
+            try:
+                episode = EpisodicMemory(**raw)
+            except TypeError:
+                continue
+            if not isinstance(episode.summary, str) or not isinstance(episode.stream_id, str):
+                continue
+            episode.summary = episode.summary.strip()
+            episode.stream_id = episode.stream_id.strip()
+            if episode.summary and episode.stream_id:
+                episodes.append(episode)
+        self._episodes = episodes[: self.max_entries]
+
+    def save_file(self, path: str) -> None:
+        p = Path(path)
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(
+            json.dumps({"episodes": [asdict(e) for e in self._episodes]}, indent=2),
+            encoding="utf-8",
+        )
 
 
 def _is_salient(line: str) -> bool:
@@ -54,7 +190,7 @@ class ExtractiveSummarizer:
         # Over budget: drop oldest segments (after a leading ellipsis) until it fits.
         while len(parts) > 1 and len(" · ".join(parts)) > self.max_chars:
             parts.pop(0)
-        return "… · " + " · ".join(parts)
+        return _fit_text("… · " + " · ".join(parts), self.max_chars)
 
 
 class LLMSummarizer:
@@ -80,3 +216,20 @@ class LLMSummarizer:
             [ChatTurn(role="system", content=system), ChatTurn(role="user", content=user)]
         )
         return out.strip()[: self.max_chars]
+
+
+def _fit_text(text: str, max_chars: int) -> str:
+    """Hard-cap a summary without cutting past the configured budget."""
+    text = text.strip()
+    if len(text) <= max_chars:
+        return text
+    if max_chars <= 0:
+        return ""
+    ellipsis = "…"
+    if max_chars <= len(ellipsis):
+        return text[:max_chars]
+    limit = max_chars - len(ellipsis)
+    cut = text.rfind(" ", 0, limit + 1)
+    if cut <= 0:
+        cut = limit
+    return text[:cut].rstrip() + ellipsis

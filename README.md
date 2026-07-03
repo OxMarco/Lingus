@@ -116,7 +116,8 @@ flowchart LR
 * **Model backends** (`models/`) abstract the models: small ones local (ASR, VLM),
   the generator hosted (OpenAI-compatible — GPT-5.5 / Grok).
 * **Memory** (`memory/`) spans four layers: working buffer, episodic summarization,
-  durable semantic facts (cross-stream), and self-memory + dedup.
+  durable episodic summaries, durable semantic facts (cross-stream), and
+  self-memory + dedup.
 
 <p align="right">(<a href="#readme-top">back to top</a>)</p>
 
@@ -125,8 +126,10 @@ flowchart LR
 * [![Python][python-shield]][python-url]
 * [faster-whisper](https://github.com/SYSTRAN/faster-whisper) — streaming ASR
 * [yt-dlp](https://github.com/yt-dlp/yt-dlp) + [PyAV](https://github.com/PyAV-Org/PyAV) — stream capture
+* [Tenacity](https://tenacity.readthedocs.io/) — bounded retry/backoff for live chat polling
 * [Pydantic](https://docs.pydantic.dev/) — config + schemas
 * [OpenAI-compatible client](https://github.com/openai/openai-python) — hosted generator
+* [Instructor](https://github.com/567-labs/instructor) — structured LLM outputs
 
 <p align="right">(<a href="#readme-top">back to top</a>)</p>
 
@@ -139,7 +142,7 @@ To get a local copy up and running, follow these steps.
 
 ### Prerequisites
 
-* Python 3.12+
+* Python 3.12 or 3.13 (the live ASR stack does not yet support Python 3.14)
 * A virtualenv (Phase 0 installs and runs with nothing else; heavy deps are optional extras)
 
 ### Installation
@@ -151,8 +154,8 @@ To get a local copy up and running, follow these steps.
    ```
 2. Create and activate a virtualenv
    ```sh
-   python -m venv venv
-   source venv/bin/activate
+   python3.12 -m venv .venv312
+   source .venv312/bin/activate
    ```
 3. Install the package (core + dev tooling)
    ```sh
@@ -160,7 +163,7 @@ To get a local copy up and running, follow these steps.
    ```
 4. Install optional extras for later phases as needed
    ```sh
-   pip install -e ".[asr,youtube,llm]"
+   pip install -e ".[asr,youtube,llm,video-mlx]"
    ```
 5. Copy the env template and fill in keys when wiring Phase 1
    ```sh
@@ -218,15 +221,26 @@ is read-only by design.)
    ```
 
 Useful flags: `--language it|en|auto` (pin ASR language; default `en`),
-`--asr-model small|medium|large-v3` (only `medium` is cached — others re-download),
+`--asr-model small|medium|large-v3|turbo` (this checkout targets `turbo`;
+uncached models download on first use),
 `--research` / `--no-research` (force or skip cold-start channel profiling),
-`--dashboard` or `--web --web-port 8080` (live view of world-state, arbiter scores,
-and would-be posts).
+`--vlm-backend mlx_vlm|local_cv|none` and `--vlm-model <mlx-model>` (local
+Phase-4 video scene state), `--dashboard` or `--web --web-port 8080` (live view
+of world-state, arbiter scores, and would-be posts).
+
+Live audio is gated before ASR so music beds and song lyrics do not become
+transcript context. The schema/default config uses the lightweight `spectral`
+gate. Install the optional audio ML stack when setting
+`models.audio_gate.backend: hf_ast`.
 
 > **Caveats.** The stream must be **live** (VODs give no chat continuation); the first
-> run downloads the ASR model unless `medium` is cached; on Apple Silicon ASR runs
-> CPU/int8 (no Metal), which is why `medium`/10s-window is the tuned default; video is
-> not wired yet (Phase 4), so this is audio + chat only.
+> run downloads any uncached ASR/VLM models; on Apple Silicon ASR runs
+> CPU/int8 (no Metal), so `turbo`/10s-window should be validated on first run; live
+> video analysis is local. The live default is MLX-VLM +
+> `mlx-community/Qwen2.5-VL-3B-Instruct-4bit` on Apple Silicon, falling back to
+> coarse brightness/color/contrast analysis when `mlx-vlm` or the model is not
+> installed. Use `--vlm-model mlx-community/Qwen2.5-VL-7B-Instruct-4bit` for
+> slower, higher-detail offline checks.
 
 Run the test suite and linter:
 
@@ -248,11 +262,10 @@ ruff check src tests
     - Remaining: validate the real LLM generator live; post path lands with the Twitch adapter
 - [x] **Phase 2** — chat perception: `ChatTrendDetector` (hype/pile-on) built and wired into the arbiter; keyless YouTube live-chat ingestion (`YouTubeLiveChatClient`) wired into `ObserveChatAdapter`
 - [x] **Phase 3** — memory: working + self-memory + dedup/bit-fatigue + episodic summarization + semantic (durable cross-stream facts)
-- [ ] **Phase 4** — video: frame gating + VLM scene state — `youtube.py` `video_frames()` is a stub
-- [ ] **Phase 5** — hardening
-    - Done: output moderation pass (`RegexModeration`, authoritative gate in the post path); output governor (rate + length caps)
-    - Remaining: mid-flight staleness/barge-in abort, per-signal cooldowns, guard-model moderation backend
-- [x] **Phase 6** — eval loop: record / replay / judge (`--eval`, heuristic + LLM-as-judge)
+- [x] **Phase 3.5** — memory hardening: durable per-stream episodic summaries (`.lingus/episodes.json`) surface prior stream context without adding a vector/RAG database yet
+- [ ] **Phase 4** — video: YouTube RGB frame capture + deterministic frame gate + local MLX-VLM (`Qwen2.5-VL-3B-Instruct-4bit`) scene-state backend wired, with `local_cv` fallback; remaining: live latency tuning and richer OpenCV/PySceneDetect gating
+- [x] **Phase 5** — lean hardening: pre-ASR speech/music audio gate; output moderation pass (`RegexModeration`, authoritative gate in the post path); output governor (rate + length caps). Keep latency-heavy guard models and barge-in machinery out of the hot path unless real evals prove they are needed.
+- [x] **Phase 6** — eval loop: record / replay / judge (`--eval`, local heuristic judge)
 - [x] **Cold-start research** — profile the channel pre-loop and seed durable memory (`research/`, per-channel cache)
 - [ ] **Final** — Twitch adapter
 

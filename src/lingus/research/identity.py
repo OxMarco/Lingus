@@ -3,20 +3,18 @@
 A `ChannelIdentity` is the raw, factual starting point for research: the
 channel's name, what it says about itself, its tags, and a few recent video
 titles. On YouTube this is free — `yt-dlp` already ships the metadata alongside
-the media URL we resolve for capture, so one extra `--dump-single-json` call
-gets us everything without touching the Data API or an OAuth flow. On other
+the media URL we resolve for capture, so one Python API extraction gets us
+everything without touching the Data API or an OAuth flow. On other
 platforms (or offline replay) there's no feed to introspect, so identity comes
 from a channel name configured in `research.channel`.
 """
 
 from __future__ import annotations
 
-import asyncio
-import json
-import sys
 from dataclasses import dataclass, field
 
 from ..logging import get_logger
+from ..yt_dlp_api import YtDlpError, extract_info, watch_url
 
 log = get_logger(__name__)
 
@@ -41,45 +39,24 @@ class ChannelIdentity:
         return f"{self.platform}_{safe}" or self.platform
 
 
-def _watch_url(video: str) -> str:
-    if video.startswith("http://") or video.startswith("https://"):
-        return video
-    return f"https://www.youtube.com/watch?v={video}"
-
-
 async def _dump_json(url: str, *, timeout: float = 30.0) -> dict | None:
-    """Best-effort `yt-dlp --dump-single-json`. Returns None on any failure —
-    research must never be able to stop the stream from starting."""
+    """Best-effort yt-dlp metadata. Research must never stop stream startup."""
     try:
-        proc = await asyncio.create_subprocess_exec(
-            sys.executable, "-m", "yt_dlp",
-            "--dump-single-json", "--skip-download", "--no-warnings", "-q",
-            "--playlist-items", "0",  # channel/playlist: metadata only, no per-video fetch
+        return await extract_info(
             url,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
+            timeout=timeout,
+            ydl_opts={
+                # Channel/playlist URLs: fetch metadata only, no per-video crawl.
+                "playlist_items": "0",
+            },
         )
-    except (OSError, ValueError) as exc:  # yt-dlp not importable / bad args
-        log.warning("research: yt-dlp not available (%s)", exc)
-        return None
-    try:
-        out, err = await asyncio.wait_for(proc.communicate(), timeout=timeout)
-    except TimeoutError:
-        proc.kill()
-        log.warning("research: yt-dlp metadata timed out for %s", url)
-        return None
-    if proc.returncode != 0:
-        log.warning("research: yt-dlp metadata failed: %s", err.decode(errors="replace").strip())
-        return None
-    try:
-        return json.loads(out.decode(errors="replace"))
-    except json.JSONDecodeError:
-        log.warning("research: yt-dlp returned non-JSON metadata for %s", url)
+    except YtDlpError as exc:
+        log.warning("research: %s", exc)
         return None
 
 
 async def _resolve_youtube(video: str) -> ChannelIdentity | None:
-    watch = _watch_url(video)
+    watch = watch_url(video)
     data = await _dump_json(watch)
     if data is None:
         return None

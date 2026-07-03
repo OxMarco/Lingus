@@ -180,6 +180,28 @@ async def test_llm_judge_uses_backend_reply():
 
 
 @pytest.mark.asyncio
+async def test_llm_judge_prefers_structured_backend():
+    class StructuredBackend:
+        async def generate_structured(self, response_model, messages, **opts):
+            return response_model(
+                in_character=10,
+                not_generic=7,
+                not_repetitive=4,
+                note="specific but a bit echoed",
+            )
+
+        async def generate(self, messages, **opts):  # pragma: no cover - should not run
+            raise AssertionError("raw JSON fallback should not be used")
+
+    judge = LLMJudge(StructuredBackend())
+    score = await judge.score(_sample("nice line"), _persona(), [])
+    assert score.in_character == pytest.approx(1.0)
+    assert score.not_generic == pytest.approx((7 - 1) / 9)
+    assert score.not_repetitive == pytest.approx((4 - 1) / 9)
+    assert score.notes == "specific but a bit echoed"
+
+
+@pytest.mark.asyncio
 async def test_llm_judge_falls_back_on_bad_json():
     backend = _FakeBackend("I refuse to answer in JSON")
     judge = LLMJudge(backend)  # default fallback = HeuristicJudge

@@ -1,7 +1,7 @@
 # Dependencies to install and run the live bot (YouTube observe-mode:
 # audio capture -> ASR -> arbiter -> generator -> web tuner UI).
 #
-# Requires Python 3.12  (faster-whisper / ctranslate2 have no wheels for 3.14).
+# Requires Python 3.12 or 3.13  (faster-whisper / ctranslate2 have no wheels for 3.14).
 # Also requires the ffmpeg BINARY on PATH (not a pip package):  brew install ffmpeg
 #
 #   python3.12 -m venv .venv
@@ -19,21 +19,32 @@
 pydantic>=2.13.4
 pydantic-settings>=2.14.2
 pyyaml>=6.0.3
+tenacity>=9.1.4
 
 # --- live stream capture (resolves the YouTube live audio URL for ffmpeg) ---
 yt-dlp>=2026.6.9
 
-# --- speech -> text (ASR). Pulls ctranslate2 + numpy as transitive deps. ---
+# --- speech -> text (ASR) + lightweight pre-ASR speech/music gate. ---
 faster-whisper>=1.2.1
+numpy>=1.26
 
-# --- hosted generator over any OpenAI-compatible endpoint (OpenAI / Grok / Claude) ---
+# Optional heavier Hugging Face AudioSet gate:
+#   pip install -e ".[audio-ml]"
+#   then set models.audio_gate.backend: hf_ast
+
+# --- hosted text generator / summarizer over any OpenAI-compatible endpoint ---
 openai>=2.44.0
+instructor>=1.15,<2
+
+# --- optional local video VLM / speech tagging ---
+#   pip install -e ".[video-mlx]"    # MLX-VLM + Qwen2.5-VL on Apple Silicon
+#   pip install -e ".[speech-tags]"  # sherpa-onnx embeddings (next slice)
 
 # --- live web tuner UI sidecar (lingus --web) ---
 aiohttp>=3.14.1
 
 # --- optional: live terminal dashboard (lingus --dashboard). Safe to omit. ---
-rich>=15.0.0
+rich>=13.7,<15
 
 # The lingus package itself (editable). Keeps a single install command.
 -e .

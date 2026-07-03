@@ -10,6 +10,7 @@ from __future__ import annotations
 import abc
 from collections.abc import AsyncIterator
 from dataclasses import dataclass, field
+from typing import Literal
 
 from ..adapters.base import AudioChunk, Frame
 from ..world_state import SceneState
@@ -21,6 +22,17 @@ class Transcript:
     ts: float
     is_final: bool = True
     confidence: float | None = None
+
+
+@dataclass(slots=True)
+class AudioGateDecision:
+    """Speech/music gate decision for an audio window before ASR."""
+
+    allow_asr: bool
+    mode: Literal["speech", "music", "mixed", "silence", "unknown"]
+    speech_score: float = 0.0
+    music_score: float = 0.0
+    reason: str = ""
 
 
 @dataclass(slots=True)
@@ -44,10 +56,20 @@ class ASRBackend(abc.ABC):
         """Consume audio chunks, yield transcripts as speech is recognized."""
 
 
+class AudioGateBackend(abc.ABC):
+    @abc.abstractmethod
+    def gate_stream(self, chunks: AsyncIterator[AudioChunk]) -> AsyncIterator[AudioChunk]:
+        """Yield only audio that should reach ASR, replacing dropped spans with silence."""
+
+
 class VLMBackend(abc.ABC):
     @abc.abstractmethod
     async def describe_change(self, frame: Frame, prev: SceneState) -> SceneState:
-        """Report what CHANGED relative to the prior scene state."""
+        """Report what CHANGED relative to the prior scene state.
+
+        The historical name is VLMBackend, but implementations may be local
+        deterministic analyzers; live video should not require a hosted vision API.
+        """
 
 
 class LLMBackend(abc.ABC):

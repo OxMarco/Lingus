@@ -62,8 +62,13 @@ than any single library choice.
    Timestamp the triggering context, re-check relevance before posting, and support
    aborting an in-flight reply if something more important happens.
 
-9. **Review output** A regex filter pass runs on every generated
-   message before it is posted preventing spam or offensive language (but jokes, satire, colloquial and fun language is allowed).
+9. **Output safety is delegated to the hosted generator, not a local filter.**
+   The reply text comes from a hosted LLM that already refuses to produce hate,
+   threats, CSAE and the like; a local regex denylist duplicating that was
+   removed as redundant. The deterministic last line is the **output governor**
+   (rate + length), not a moderation pass. Note the one gap this accepts:
+   verbatim trend mirrors (chat echoed with no LLM in the loop) now post
+   unfiltered — revisit if that proves a problem live.
 
 10. **You can't tune personality blind.** A replay/eval harness is a first-class
     component, not an afterthought.
@@ -96,7 +101,7 @@ than any single library choice.
    │ long-term│   └─────────┬──────────┘
    └──────────┘             ▼
                   ┌────────────────────┐
-                  │ SAFETY FILTER      │                moderation pass
+                  │ OUTPUT GOVERNOR    │                rate + length caps
                   └─────────┬──────────┘
                             ▼
                   ┌────────────────────┐
@@ -141,8 +146,11 @@ and can follow its own thread).
 - Enforces brevity, no "assistant voice," no trailing "how can I help?".
 - Driven by an **exemplar bank** (concrete sample reactions), not adjective lists.
 
-### Safety filter
-- Moderation pass on the generated text before posting. Drop/regenerate on fail.
+### Safety
+- No local moderation pass. Output safety is delegated to the hosted generator,
+  which already refuses unsafe content; the former `RegexModeration` denylist was
+  removed as redundant (see §2.9). Verbatim trend mirrors are the one uncovered
+  path and post unfiltered.
 
 ### Output governor
 - The **deterministic last line** before a message is posted. Everything upstream is
@@ -158,7 +166,7 @@ and can follow its own thread).
   longer truncates; the cap lives here so it's a single source of truth, not dead code.
 - **Optional typing delay:** a flavor knob only, disabled by default for live
   responsiveness. The hot path should not wait on theatrical pacing.
-- Lives between the safety filter and the post; tunable via `output:` in `config.yaml`.
+- The last stage before the post; tunable via `output:` in `config.yaml`.
 
 ### Output
 - Post to stream chat via the platform library. Re-inject into world state.
@@ -221,11 +229,11 @@ websocket — not the core.
 | Component | Primary pick | Alternative / backup | Notes |
 |---|---|---|---|
 | Stream A/V capture | Streamlink + FFmpeg (PyAV) | yt-dlp | Pulls live feed, demuxes audio + frames |
-| Pipeline spine | Pipecat | thin asyncio loop | Processors per stage; arbiter & safety are custom processors |
+| Pipeline spine | Pipecat | thin asyncio loop | Processors per stage; the arbiter is a custom processor |
 | Chat ingestion | TwitchIO (Twitch) | pytchat / YouTube Data API | Async, EventSub over WebSocket |
 | Speech → text (ASR) | faster-whisper `turbo` | Parakeet on NVIDIA | M4 Max/64 GB can target large-v3-turbo locally; Silero VAD is bundled |
 | Video frame gating | local RGB diff + OpenCV/PySceneDetect later | — | Cheap diff; analyze only on real change |
-| Scene state | MLX-VLM + Qwen2.5-VL 3B 4-bit | `local_cv` fallback / 7B offline override | Local Apple Silicon VLM; no hosted vision API |
+| Scene state | MLX-VLM + Qwen2.5-VL 3B 4-bit | 7B offline override | Local Apple Silicon VLM; no hosted vision API; no colour-only fallback (a broken VLM terminates the run) |
 | Speech tagging | sherpa-onnx embeddings | spectral/HF audio gate | Next local audio semantics slice |
 | Audio events (optional) | lightweight audio tagger | skip for v1 | Non-speech sounds; low priority |
 | Generator LLM | hosted API *or* self-host Qwen3 / Mistral / GLM | — | Text output gives latency headroom |
@@ -234,7 +242,7 @@ websocket — not the core.
 | Working/episodic memory | custom (rolling buffer + summarization) | — | Don't reach for a framework here |
 | Long-term/semantic memory | Mem0 (optional) | hand-rolled extraction | Adopt when manual version creaks |
 | Vector DB | Chroma (proto) → pgvector or Qdrant | — | Near-non-decision at this scale |
-| Output moderation | `RegexModeration` first | platform/guard API only if needed | Cheap pre-post safety pass; keep model-based moderation out of the hot path unless evals prove the regex gate is insufficient |
+| Output moderation | delegated to the hosted generator | platform/guard API only if evals demand it | The local `RegexModeration` denylist was removed as redundant with the generator's own refusals; add moderation back only if verbatim trend mirrors or a self-hosted model prove it necessary |
 | Eval / replay harness | custom recorded segments + heuristic judge | optional local/explicit judge later | Lets you tune personality without hidden hosted calls |
 | Persona patterns (reference) | SillyTavern character cards + lorebooks | — | Design reference, not a runtime dep |
 
@@ -286,14 +294,16 @@ loop is the thing to validate early.
   the corpus is large enough or evals show obvious callback misses.
 
 ### Phase 4 — Video
-- Frame capture + diff-gating (OpenCV/PySceneDetect).
+- Frame capture + diff-gating (local RGB diff; richer OpenCV/PySceneDetect gating deferred).
 - Local scene-state analysis with change-reporting.
 - Add on-screen events to arbiter signals.
 - *(Last because it's the most expensive and lowest early marginal value.)*
 
 ### Phase 5 — Lean hardening
 - Keep only cheap deterministic guardrails in the hot path: pre-ASR audio gating,
-  output moderation, output rate/length caps, and repetition/bit-fatigue.
+  output rate/length caps, and repetition/bit-fatigue. (Output moderation was
+  originally here as a regex denylist; it has since been removed as redundant with
+  the hosted generator's own refusals — see §2.9.)
 - Use the existing cheap trigger-age/staleness checks, but do not build mid-flight
   abort/barge-in machinery or per-signal cooldown systems unless evals show a real
   problem. Reply latency beats cleverness here.
@@ -303,6 +313,28 @@ loop is the thing to validate early.
 - Replay the bot offline; score outputs (in-character / not-generic / not-repetitive)
   with a deterministic heuristic judge by default.
 - Use it to tune arbiter weights and the exemplar bank.
+
+### Phase 7 — Platform write path (Twitch + Kick)
+- The only posting path through Phase 6 is observe/read-only (`ObserveChatAdapter`
+  logs the reply it *would* post). This phase builds the real write path: Twitch and
+  Kick posting adapters (OAuth + post), re-injecting the bot's own posts into world
+  state like any other event. Multi-platform is additive via the adapter seam.
+
+### Phase 8 — Live validation & regression testing
+- The build across Phases 1–7 is complete; this phase is where the wired-but-not-yet-
+  exercised paths get validated live and locked down against regression. Testing is
+  bucketed here on purpose — a subsystem being "done" means it is built and unit-tested,
+  not that every live/latency/download path has been walked.
+- **Generator (Phase 1 finish):** validate the real hosted LLM generator live with an
+  API key; the deterministic template is a placeholder, not the personality.
+- **Chat ingestion (Phase 2 follow-up):** validate keyless YouTube live-chat ingestion
+  against more live streams as YouTube's InnerTube payloads drift.
+- **Video (Phase 4 follow-up):** live latency tuning of the MLX-VLM backend;
+  install/download validation (`pip install -e ".[video-mlx]"`, model cache, Metal);
+  optional richer OpenCV/PySceneDetect frame gating.
+- **Eval regression (Phase 6 follow-up):** curate a library of recorded segments to
+  regression-test personas against, and wire the report back into an automated
+  arbiter-weight tuning sweep.
 
 ---
 
@@ -316,7 +348,8 @@ loop is the thing to validate early.
   invent objects/text the local analyzer cannot verify.
 - **Assistant-voice leak** → brevity caps, no trailing questions, opinions allowed.
 - **Context loss over long streams** → episodic summarization.
-- **Unsafe output** → moderation pass before posting (never skip).
+- **Unsafe output** → delegated to the hosted generator's own refusals; no local
+  moderation pass (see §2.9). Verbatim trend mirrors are the uncovered path.
 
 ---
 
@@ -331,7 +364,7 @@ loop is the thing to validate early.
 
 ## 11. Build progress (as of 2026-07-01)
 
-State of the implementation against the Phase plan in §8. 214 tests pass, ruff clean.
+State of the implementation against the Phase plan in §8. 264 tests pass, ruff clean.
 
 ### Done
 - **Phase 0 / 0.5 — skeleton & offline loop.** Config, timestamped world-state,
@@ -368,26 +401,31 @@ State of the implementation against the Phase plan in §8. 214 tests pass, ruff 
   - **Durable episodic archive** — per-stream summaries persisted to
     `.lingus/episodes.json` via `EpisodicArchive`, then surfaced as "Past stream
     memories" in generator context. This is Phase 3.5's lightweight alternative
-    to introducing a vector/RAG database too early.
+    to introducing a vector/RAG database too early. **Channel-scoped** like
+    `SemanticStore` (shares the `ChannelIdentity.cache_key()`): the archive
+    round-trips every channel through the shared file but only surfaces its own
+    channel's summaries, so one channel's "stream so far" (e.g. a church service)
+    can't resurface as a past memory on an unrelated stream (e.g. a food
+    streamer). An unscoped archive (`channel=""`, replay/eval) sees everything.
   - **Semantic / long-term** — `SemanticStore`, durable facts persisted to
     `.lingus/semantic.json` and **loaded across streams**; hand-rolled
     token-overlap retrieval; runtime extraction uses `HeuristicFactExtractor`
     (regex) so hosted LLM calls stay limited to summarization and replies.
   - Episodic + semantic both fed from one eviction stream in `_consolidate_loop`.
   - Memory facts injected into generator context ("Known facts:" / "Stream so far:").
-- **Phase 5 — lean safety/hardening gates (DONE).** Pre-ASR speech/music gate
+- **Phase 5 — lean hardening gates (DONE).** Pre-ASR speech/music gate
   (`src/lingus/models/audio_gate.py`) keeps music/lyrics out of transcript
-  context. `src/lingus/safety.py`: `RegexModeration`
-  (implements the `ModerationBackend` ABC) — a deterministic denylist for hate
-  slurs (leetspeak-tolerant), threats of violence (human-target-shaped, so
-  "kill this boss" passes), CSAE, doxxing, and (toggleable) spam shapes. Jokes,
-  satire, swearing and slang are deliberately allowed (CLAUDE.md §9). Wired as
-  the authoritative last gate in `_post_message` (covers generated replies AND
-  verbatim trend mirrors); the generated path also pre-checks and **regenerates
-  once** before dropping. `build_moderation()` from `moderation:` config;
-  `backend: none` disables it (logs a warning — offline tuning only). The output
-  governor enforces rate and length caps; the optional typing delay is disabled
-  by default so live replies are not held. Config: `check_spam`, `extra_patterns`.
+  context. The output governor enforces rate and length caps; the optional
+  typing delay is disabled by default so live replies are not held.
+  **Output moderation removed.** The former `src/lingus/safety.py`
+  (`RegexModeration` — a deterministic hate/violence/CSAE/doxx/spam denylist,
+  wired as the authoritative last gate in `_post_message`) was deleted as
+  redundant with the hosted generator's own refusals (§2.9). The
+  `ModerationBackend`/`ModerationResult` ABCs, the `moderation:` config block,
+  and `_build_safety` are gone; `_post_message` now runs humanizer → governor
+  → post. **Accepted gap:** verbatim trend mirrors (chat echoed with no LLM in
+  the loop) post unfiltered — the one path the generator's refusals never
+  covered. Revisit if it bites live.
 
 - **Cold-start channel research (DONE).** `src/lingus/research/`: before the loop
   starts, profile the streamer and seed the durable (semantic) memory so the bot
@@ -403,14 +441,19 @@ State of the implementation against the Phase plan in §8. 214 tests pass, ruff 
   loads them like any other durable fact and surfaces them into generator context.
   Entirely best-effort (never blocks the run). CLI: `--research` (force refresh),
   `--no-research` (skip). Config: `research:` block. 26 tests in `tests/research/`.
-- **Phase 4 — video (STARTED).** YouTube frame capture yields raw RGB frames from
+- **Phase 4 — video (DONE).** YouTube frame capture yields raw RGB frames from
   `video_frames()`, and `FrameGate` deterministically filters frames by RGB diff
   + minimum interval before local analysis runs. `MLXVLMSceneAnalyzer` targets
   local MLX-VLM with `mlx-community/Qwen2.5-VL-3B-Instruct-4bit` for live
-  latency on this M4 Max / 64 GB machine, with `LocalFrameAnalyzer` as a
-  no-network fallback. The 7B 4-bit model fits but was too slow in the first
-  live stream test, so keep it as an explicit offline/high-detail override.
-  Unchanged frames do not create scene events.
+  latency on this M4 Max / 64 GB machine, feeding change-reported scene state into
+  the world state (`describe_change` in `app.py`'s frame loop). There is **no
+  colour-only fallback**: if the VLM cannot load (e.g. no visible Metal device)
+  `describe_change` raises and the task supervisor terminates the run, rather than
+  silently degrading to useless brightness/contrast stats. The 7B 4-bit model fits
+  but was too slow in the first live stream test, so keep it as an explicit
+  offline/high-detail override. Unchanged frames do not create scene events.
+  Live latency tuning, install/download validation, and richer OpenCV/PySceneDetect
+  gating are deferred to Phase 8 (validation & regression testing).
 - **Phase 6 — eval/replay harness (DONE).** `src/lingus/eval.py`: replay a
   recorded segment through the *real* `BotLoop` (via a `CollectingMonitor` that
   captures every posted line + its triggering context), then score each line on
@@ -423,24 +466,51 @@ State of the implementation against the Phase plan in §8. 214 tests pass, ruff 
   the exemplar bank from the report.
 
 ### Remaining
-- **Phase 1 finish:** validate the **real LLM generator** live (needs an API key
-  in `.env`); the template fallback is a placeholder, not the personality.
-- **Phase 2 follow-up:** validate keyless YouTube **live-chat ingestion** against
-  more live streams as YouTube's InnerTube payloads drift.
-- **Phase 4 — video:** local MLX-VLM scene-state backend is wired. Still open:
-  install/download validation (`pip install -e ".[video-mlx]"`, model cache) and
-  richer OpenCV/PySceneDetect gating.
-- **Phase 6 — eval/replay harness (DONE, see above).** Still open: a curated
-  library of recorded segments to regression-test personas against, and wiring the
-  report back into an automated weight-tuning sweep.
-- **Final — Twitch adapter.** Not started.
+The build is complete through Phase 6 (skeleton, speech→reply→chat, chat perception,
+memory + hardening, video, governor, eval). Two things remain: one net-new
+build (the Twitch + Kick posting adapters) and one bucket of live validation deferred
+out of the individual phases.
+
+- **Phase 7 — platform write path (build).** Twitch adapter scaffolded.
+  `src/lingus/adapters/twitch.py`: `TwitchCaptureAdapter` resolves the live HLS URL
+  with **streamlink** and reuses the shared ffmpeg pipe (extracted from YouTube into
+  `adapters/_ffmpeg.py`, so A/V capture is one code path for both platforms);
+  `TwitchChatAdapter` wraps **twitchio** (2.x IRC API, pinned `>=2.8,<3`) and bridges
+  its callback loop to `incoming()` via an `asyncio.Queue`, with a working `post()`
+  path — this is the first real chat *write* (opt-in via `twitch.post_enabled`,
+  default off so it observes like YouTube). Wired through `build_adapters`, config
+  (`twitch:` block + `TWITCH_OAUTH_TOKEN` secret), and `_stream_memory_id`. 16 tests
+  in `tests/test_twitch.py` (twitchio/streamlink faked via `sys.modules`). Still open:
+  YouTube posting (OAuth), a Kick adapter (streamlink built-in plugin for A/V + the
+  official Kick API for chat), and live validation with real Twitch credentials.
+- **Phase 8 — live validation & regression testing.** Everything below is *built
+  and unit-tested*; what's deferred is exercising the live/latency/download paths:
+  - Validate the **real hosted LLM generator** live (needs an API key in `.env`);
+    the template fallback is a placeholder, not the personality.
+  - Validate keyless YouTube **live-chat ingestion** across more live streams as
+    YouTube's InnerTube payloads drift.
+  - **Video:** live latency tuning; install/download validation
+    (`pip install -e ".[video-mlx]"`, model cache, Metal); richer
+    OpenCV/PySceneDetect gating.
+  - **Eval:** curate a regression library of recorded segments and wire the report
+    back into an automated arbiter-weight tuning sweep.
 
 ### Notable environment notes
-- Use `./.venv312/bin/python` for the local model stack; the old `venv` is Python
-  3.14 and cannot satisfy the project pin (`>=3.12,<3.14`).
-- `mlx-vlm` is installed in `.venv312`; in the Codex sandbox it reports no visible
-  Metal device and falls back to `local_cv`. A normal user-run terminal may expose
-  Metal and load the configured Qwen2.5-VL model.
+- Both `./.venv312` and `./venv` are Python 3.12 and satisfy the project pin
+  (`>=3.12,<3.14`); either runs the local model stack. (Python 3.14 still can't:
+  faster-whisper / ctranslate2 ship no 3.14 wheels.)
+- **`transformers` must stay `<5.13`.** 5.13 changed `AutoTokenizer.register()` and
+  breaks mlx-lm 0.31.x's tokenizer registration, which crashes `import mlx_vlm`.
+  The VLM backend's catch-all then mis-reports this as "no Metal device / missing
+  video-mlx extra" (see `models/local_vision.py`), which is misleading — the real
+  cause is the transformers version. The cap is pinned in the `audio-ml` and
+  `video-mlx` extras (pyproject) and in `requirements.txt`. If a run dies with the
+  "no Metal device" message, first check `transformers.__version__`.
+- `mlx-vlm` is installed in both venvs; in the Codex sandbox it reports no visible
+  Metal device, so with video enabled the run now terminates instead of degrading
+  (there is no colour-only fallback). A normal user-run terminal exposes Metal and
+  loads the configured Qwen2.5-VL model; set `models.vlm.backend=none` to run
+  without video where Metal is unavailable.
 - `turbo` ASR and the MLX-VLM model may need first-run downloads if not cached.
 - `.lingus/semantic.json` is the cross-stream memory file (gitignored).
 - `.lingus/episodes.json` is the durable per-stream summary archive (gitignored).

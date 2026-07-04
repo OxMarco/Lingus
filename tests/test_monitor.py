@@ -54,7 +54,7 @@ async def test_loop_emits_tick_reports_with_post():
     monitor = RecordingMonitor()
     loop = BotLoop(
         settings=settings,
-        persona=PersonaSpec(name="Gremlin", voice="brief"),
+        persona=PersonaSpec(name="Lingus", voice="brief"),
         capture=EmptyCaptureAdapter(),
         chat=CollectingChatAdapter(),
         segment="tests/samples/cake",
@@ -79,7 +79,7 @@ async def test_loop_emits_report_even_when_holding():
     monitor = RecordingMonitor()
     loop = BotLoop(
         settings=settings,
-        persona=PersonaSpec(name="Gremlin", voice="brief"),
+        persona=PersonaSpec(name="Lingus", voice="brief"),
         capture=EmptyCaptureAdapter(),
         chat=CollectingChatAdapter(),
         segment=None,
@@ -102,7 +102,7 @@ async def test_loop_tick_report_includes_memory_context():
     monitor = RecordingMonitor()
     loop = BotLoop(
         settings=settings,
-        persona=PersonaSpec(name="Gremlin", voice="brief"),
+        persona=PersonaSpec(name="Lingus", voice="brief"),
         capture=EmptyCaptureAdapter(),
         chat=CollectingChatAdapter(),
         segment=None,
@@ -133,7 +133,7 @@ def test_dashboard_renders_synthetic_ticks_headless():
     assert _sparkline([0.0, 0.5, 1.0], 0.0, 1.0)[0] != _sparkline([0.0, 0.5, 1.0], 0.0, 1.0)[-1]
     assert len(_mood_bar(0.0, width=10)) == 10
 
-    dash = RichDashboard("Gremlin", "file_replay")
+    dash = RichDashboard("Lingus", "file_replay")
     for i in range(3):
         dash.on_tick(
             TickReport(
@@ -168,7 +168,7 @@ async def test_web_monitor_surfaces_server_task_failure():
             raise RuntimeError("port already taken")
 
     monitor = FailingWebMonitor(
-        ControlState(Settings.model_validate({})), "Gremlin", "file_replay"
+        ControlState(Settings.model_validate({})), "Lingus", "file_replay"
     )
     monitor.start()
     await asyncio.sleep(0)
@@ -190,7 +190,7 @@ def test_web_monitor_payload_includes_memory_context():
     from lingus.context import ChatLine
     from lingus.webui import WebMonitor
 
-    monitor = WebMonitor(ControlState(Settings.model_validate({})), "Gremlin", "file_replay")
+    monitor = WebMonitor(ControlState(Settings.model_validate({})), "Lingus", "file_replay")
 
     payload = monitor._tick_payload(  # noqa: SLF001 - payload builder is the unit under test
         TickReport(

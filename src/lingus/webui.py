@@ -58,6 +58,9 @@ class WebMonitor:
         self._runner: web.AppRunner | None = None
         self._start_t: float | None = None
         self._tick_no = 0
+        # Promotional-share readout: plugs posted vs. all posts (see promotions.py).
+        self._n_posted = 0
+        self._n_promo = 0
 
     # --- Monitor protocol ---
     def start(self) -> None:
@@ -96,11 +99,21 @@ class WebMonitor:
         if self._start_t is None:
             self._start_t = report.t
         self._tick_no += 1
+        if report.posted:
+            self._n_posted += 1
+            if report.condition:  # this post went out under a plug
+                self._n_promo += 1
         payload = self._tick_payload(report)
         self._latest_tick = payload
         if report.posted:
             self._messages.appendleft(
-                {"kind": "posted", "text": report.posted, "clock": payload["clock"]}
+                {
+                    "kind": "posted",
+                    "text": report.posted,
+                    "clock": payload["clock"],
+                    "promo": bool(report.condition),
+                    "condition": report.condition,
+                }
             )
         elif report.dropped:
             self._messages.appendleft(
@@ -120,6 +133,14 @@ class WebMonitor:
         log.error("web UI server failed", exc_info=(type(exc), exc, exc.__traceback__))
 
     # --- payload builders ---
+    def _promo_stats(self) -> dict[str, Any]:
+        share = self._n_promo / self._n_posted if self._n_posted else 0.0
+        return {
+            "posts_total": self._n_posted,
+            "posts_promo": self._n_promo,
+            "promo_share": round(share, 4),
+        }
+
     def _tick_payload(self, report: TickReport) -> dict[str, Any]:
         d = report.decision
         elapsed = 0.0 if self._start_t is None else report.t - self._start_t
@@ -141,6 +162,8 @@ class WebMonitor:
             "semantic_facts": list(report.semantic_facts),
             "posted": report.posted,
             "dropped": report.dropped,
+            "condition": report.condition,
+            "promo": self._promo_stats(),
         }
 
     def _init_payload(self) -> dict[str, Any]:
@@ -153,6 +176,7 @@ class WebMonitor:
             "controls": self.controls.values(),
             "messages": list(self._messages),
             "tick": self._latest_tick,
+            "promo": self._promo_stats(),
         }
 
     # --- websocket plumbing ---
@@ -232,7 +256,7 @@ _INDEX_HTML = r"""<!doctype html>
   :root {
     --bg:#0f1115; --panel:#181b22; --panel2:#1f232c; --ink:#e6e8ee; --dim:#8b93a3;
     --accent:#b388ff; --green:#5ad17a; --red:#ff6b6b; --amber:#ffc857; --blue:#5aa9ff;
-    --line:#2a2f3a;
+    --promo:#ff8fd0; --line:#2a2f3a;
   }
   * { box-sizing:border-box; }
   body { margin:0; background:var(--bg); color:var(--ink);
@@ -241,13 +265,18 @@ _INDEX_HTML = r"""<!doctype html>
     border-bottom:1px solid var(--line); background:var(--panel); }
   header .name { font-weight:700; color:var(--accent); }
   header .dim { color:var(--dim); }
+  header .streamlink { color:var(--blue); text-decoration:none; }
+  header .streamlink:hover { text-decoration:underline; }
   #conn { margin-left:auto; font-size:12px; }
   #conn.up { color:var(--green); } #conn.down { color:var(--red); }
-  main { display:grid; grid-template-columns:320px 1fr; gap:14px; padding:14px 18px; align-items:start; }
+  main { display:grid; grid-template-columns:1fr; gap:14px; padding:14px 18px; align-items:start; }
   .panel { background:var(--panel); border:1px solid var(--line); border-radius:8px; padding:14px; }
   .panel h2 { margin:0 0 10px; font-size:12px; letter-spacing:.08em; text-transform:uppercase; color:var(--dim); }
   .grid2 { display:grid; grid-template-columns:1fr 1fr; gap:14px; }
-  @media (max-width:900px){ main{grid-template-columns:1fr;} .grid2{grid-template-columns:1fr;} }
+  @media (max-width:900px){ .grid2{grid-template-columns:1fr;} }
+  .grid3 { display:grid; grid-template-columns:1fr 1fr 1fr; gap:14px; }
+  @media (max-width:1200px){ .grid3{grid-template-columns:1fr 1fr;} }
+  @media (max-width:760px){ .grid3{grid-template-columns:1fr;} }
 
   .fab { position:fixed; left:18px; bottom:18px; z-index:30; width:52px; height:52px;
     border-radius:50%; border:1px solid #6f55b6; background:var(--accent); color:#140d20;
@@ -264,19 +293,6 @@ _INDEX_HTML = r"""<!doctype html>
   .sheet-head h2 { margin:0; font-size:12px; letter-spacing:.08em; text-transform:uppercase; color:var(--dim); }
   .icon-btn { width:34px; height:34px; border-radius:8px; border:1px solid var(--line);
     background:var(--panel2); color:var(--ink); cursor:pointer; font-size:20px; line-height:1; }
-
-  .profile-name { font-size:22px; font-weight:800; color:var(--ink); margin-bottom:10px; overflow-wrap:anywhere; }
-  .profile-meta { display:grid; grid-template-columns:84px 1fr; gap:6px 10px; margin-bottom:16px; }
-  .profile-meta .k, .research .k { color:var(--dim); font-size:11px; text-transform:uppercase; letter-spacing:.06em; }
-  .profile-meta .v { min-width:0; overflow-wrap:anywhere; }
-  .profile-meta a { color:var(--blue); text-decoration:none; }
-  .profile-meta a:hover { text-decoration:underline; }
-  .research .summary { color:var(--ink); white-space:pre-wrap; overflow-wrap:anywhere; margin-bottom:10px; }
-  .research ul { margin:0 0 12px 0; padding-left:18px; color:var(--ink); }
-  .research li { margin-bottom:6px; }
-  .sources { display:flex; flex-wrap:wrap; gap:6px; }
-  .sources a { max-width:100%; color:var(--dim); background:var(--panel2); border:1px solid var(--line);
-    border-radius:8px; padding:3px 7px; text-decoration:none; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
 
   /* toggle */
   .toggle { display:flex; align-items:center; gap:10px; margin-bottom:14px; }
@@ -313,22 +329,40 @@ _INDEX_HTML = r"""<!doctype html>
 
   .ctx .k { color:var(--dim); font-size:11px; text-transform:uppercase; letter-spacing:.06em; }
   .ctx .v { margin:4px 0 12px; white-space:pre-wrap; word-break:break-word; }
+  .ctx .grouphead { color:var(--accent); font-size:11px; font-weight:700; letter-spacing:.08em;
+    text-transform:uppercase; margin:14px 0 8px; padding-bottom:6px; border-bottom:1px solid var(--line); }
+  .ctx .grouphead:first-of-type { margin-top:2px; }
   .memlist { margin:4px 0 12px; padding-left:18px; color:var(--ink); }
   .memlist li { margin-bottom:6px; overflow-wrap:anywhere; }
-  .chatline b { color:var(--blue); }
+  .chatfeed { margin:4px 0 12px; max-height:220px; overflow:auto; }
+  .chatfeed .cline { margin-bottom:5px; overflow-wrap:anywhere; }
+  .chatfeed .cauthor { color:var(--blue); margin-right:6px; }
 
   #log { max-height:340px; overflow:auto; }
   .msg { padding:7px 9px; border-radius:7px; margin-bottom:6px; background:var(--panel2); }
   .msg.posted { border-left:3px solid var(--green); }
   .msg.dropped { border-left:3px solid var(--amber); color:var(--dim); }
+  /* promotional posts stand out: pink rail + a tinted background + an arm tag */
+  .msg.posted.promo { border-left:3px solid var(--promo); background:rgba(255,143,208,.10); }
   .msg .t { color:var(--dim); font-size:11px; margin-right:6px; }
+  .msg .adtag { display:inline-block; font-size:10px; font-weight:700; letter-spacing:.04em;
+    text-transform:uppercase; color:#2a0c1e; background:var(--promo); border-radius:9px;
+    padding:1px 7px; margin-right:6px; vertical-align:1px; }
   .empty { color:var(--dim); }
+  /* promotional-share readout */
+  .promostat { margin:2px 0 10px; }
+  .promostat .row { display:flex; justify-content:space-between; align-items:baseline;
+    font-size:12px; color:var(--dim); margin-bottom:4px; }
+  .promostat .row b { color:var(--promo); font-weight:700; }
+  .promostat .track { height:8px; background:var(--panel2); border-radius:5px; overflow:hidden; }
+  .promostat .fill { height:100%; width:0%; background:var(--promo); transition:width .2s; }
 </style>
 </head>
 <body>
 <header>
   <span class="name" id="persona">Lingus</span>
   <span class="dim" id="platform"></span>
+  <a class="dim" id="streamer" target="_blank" rel="noopener"></a>
   <span class="dim" id="uptime"></span>
   <span id="conn" class="down">● connecting…</span>
 </header>
@@ -347,25 +381,6 @@ _INDEX_HTML = r"""<!doctype html>
   <div class="deriv" id="deriv"></div>
 </aside>
 <main>
-  <!-- LEFT: stream profile -->
-  <section class="panel stream-profile">
-    <h2>stream</h2>
-    <div class="profile-name" id="streamer">—</div>
-    <div class="profile-meta">
-      <div class="k">platform</div><div class="v" id="streamPlatform">—</div>
-      <div class="k">live</div><div class="v"><a id="liveLink" target="_blank" rel="noopener">—</a></div>
-    </div>
-    <div class="research">
-      <h2>web search context</h2>
-      <div class="summary" id="researchSummary">—</div>
-      <div class="k">facts</div>
-      <ul id="researchFacts"><li>—</li></ul>
-      <div class="k">sources</div>
-      <div class="sources" id="researchSources">—</div>
-    </div>
-  </section>
-
-  <!-- RIGHT: live view -->
   <div style="display:grid; gap:14px;">
     <section class="panel">
       <h2>arbiter — should I speak?</h2>
@@ -380,18 +395,30 @@ _INDEX_HTML = r"""<!doctype html>
       </div>
     </section>
 
-    <div class="grid2">
+    <div class="grid3">
       <section class="panel ctx">
-        <h2>context collected</h2>
-        <div class="k">scene</div><div class="v" id="scene">—</div>
-        <div class="k">speech (asr)</div><div class="v" id="speech">—</div>
-        <div class="k">chat</div><div class="v" id="chat">—</div>
+        <h2>Perception</h2>
+        <div class="grouphead">speech</div>
+        <div class="v" id="speech">—</div>
+        <div class="grouphead">video</div>
+        <div class="v" id="scene">—</div>
+        <div class="grouphead">chat</div>
+        <div class="chatfeed" id="chatfeed"><div class="empty">—</div></div>
+      </section>
+      <section class="panel ctx">
+        <h2>Memory</h2>
+        <div class="grouphead">short-term memory</div>
         <div class="k">stream so far</div><div class="v" id="episodicSummary">—</div>
+        <div class="grouphead">long-term memory</div>
         <div class="k">past stream memories</div><ul class="memlist" id="episodicHistory"><li>—</li></ul>
-        <div class="k">known facts</div><ul class="memlist" id="semanticFacts"><li>—</li></ul>
+        <div class="k">About the streamer</div><ul class="memlist" id="semanticFacts"><li>—</li></ul>
       </section>
       <section class="panel">
         <h2>bot messages</h2>
+        <div class="promostat" id="promostat">
+          <div class="row"><span>promotional</span><span><b id="promoPct">0%</b> <span id="promoCount" class="dim"></span></span></div>
+          <div class="track"><div class="fill" id="promoFill"></div></div>
+        </div>
         <div id="log"><div class="empty">no posts yet — watching</div></div>
       </section>
     </div>
@@ -422,12 +449,21 @@ function handle(m) {
     buildParams();
     renderControls();
     renderMessages(m.messages || []);
+    renderPromo(m.promo);
     if (m.tick) renderTick(m.tick);
   } else if (m.type === "state") {
     controls = m.controls; renderControls();
   } else if (m.type === "tick") {
-    renderTick(m); pushMessage(m);
+    renderTick(m); pushMessage(m); renderPromo(m.promo);
   }
+}
+
+function renderPromo(p) {
+  if (!p) return;
+  const pct = Math.round((p.promo_share || 0) * 100);
+  $("promoPct").textContent = pct + "%";
+  $("promoFill").style.width = pct + "%";
+  $("promoCount").textContent = `${p.posts_promo || 0}/${p.posts_total || 0} posts`;
 }
 
 function buildParams() {
@@ -459,16 +495,6 @@ function buildParams() {
 
 function fmt(s, v) { return s.kind === "int" ? String(Math.round(v)) : (+v).toFixed(2); }
 
-function titleCase(s) {
-  s = s == null ? "" : String(s);
-  return s ? s.charAt(0).toUpperCase() + s.slice(1) : "—";
-}
-
-function hostLabel(url) {
-  try { return new URL(url).hostname.replace(/^www\./, ""); }
-  catch { return url || "—"; }
-}
-
 function safeHref(url) {
   try {
     const parsed = new URL(url, location.href);
@@ -477,27 +503,17 @@ function safeHref(url) {
 }
 
 function renderStream() {
-  $("streamer").textContent = stream.nickname || "unknown streamer";
-  $("streamPlatform").textContent = titleCase(stream.platform);
-  const live = $("liveLink");
-  const liveHref = safeHref(stream.live_url);
+  const streamer = $("streamer");
+  const nickname = stream.nickname || "";
+  streamer.textContent = nickname ? "· " + nickname : "";
+  const liveHref = nickname ? safeHref(stream.live_url) : "";
   if (liveHref) {
-    live.href = liveHref;
-    live.textContent = hostLabel(liveHref);
+    streamer.href = liveHref;
+    streamer.className = "streamlink";
   } else {
-    live.removeAttribute("href");
-    live.textContent = "—";
+    streamer.removeAttribute("href");
+    streamer.className = "dim";
   }
-  $("researchSummary").textContent = stream.summary || "—";
-  const facts = Array.isArray(stream.facts) ? stream.facts : [];
-  $("researchFacts").innerHTML = facts.length
-    ? facts.map(f => `<li>${esc(f)}</li>`).join("")
-    : "<li>—</li>";
-  const sources = Array.isArray(stream.source_urls) ? stream.source_urls : [];
-  const sourceLinks = sources.map((u, i) => ({ href: safeHref(u), i })).filter(s => s.href);
-  $("researchSources").innerHTML = sourceLinks.length
-    ? sourceLinks.map(s => `<a href="${escAttr(s.href)}" target="_blank" rel="noopener">source ${s.i + 1}</a>`).join("")
-    : "—";
 }
 
 function renderControls() {
@@ -543,14 +559,19 @@ function renderTick(t) {
     const kind = kinds[r];
     const c = kind === "positive" ? "pos" : kind === "blocking" ? "block" : (r === "—" ? "" : "info");
     return `<span class="chip ${c}">${r}</span>`; }).join("");
-  $("scene").textContent = t.scene || "—";
   $("speech").textContent = t.transcript || "—";
-  $("chat").innerHTML = t.chat && t.chat.length
-    ? t.chat.map(c => `<div class="chatline"><b>${esc(c.author)}:</b> ${esc(c.text)}</div>`).join("")
-    : "—";
+  $("scene").textContent = t.scene || "—";
+  renderChat(t.chat);
   $("episodicSummary").textContent = t.episodic_summary || "—";
   renderList("episodicHistory", t.episodic_history);
   renderList("semanticFacts", t.semantic_facts);
+}
+
+function renderChat(items) {
+  const list = Array.isArray(items) ? items : [];
+  $("chatfeed").innerHTML = list.length
+    ? list.map(c => `<div class="cline"><span class="cauthor">${esc(c.author)}</span>${esc(c.text)}</div>`).join("")
+    : `<div class="empty">—</div>`;
 }
 
 function renderList(id, items) {
@@ -561,21 +582,24 @@ function renderList(id, items) {
 function pushMessage(t) {
   if (!t.posted && !t.dropped) return;
   renderMessages([{ kind: t.posted ? "posted" : "dropped",
-    text: t.posted || t.dropped, clock: t.clock }], true);
+    text: t.posted || t.dropped, clock: t.clock,
+    promo: !!(t.posted && t.condition), condition: t.condition }], true);
 }
 
 function renderMessages(list, prepend) {
   const log = $("log");
   if (!prepend) log.innerHTML = "";
   if (!prepend && list.length === 0) { log.innerHTML = `<div class="empty">no posts yet — watching</div>`; return; }
-  const frag = list.map(m =>
-    `<div class="msg ${m.kind}"><span class="t">${m.clock||""}</span>${esc(m.text)}</div>`).join("");
+  const frag = list.map(m => {
+    const cls = "msg " + m.kind + (m.promo ? " promo" : "");
+    const tag = m.promo ? `<span class="adtag">${esc(m.condition || "promo")}</span>` : "";
+    return `<div class="${cls}"><span class="t">${m.clock||""}</span>${tag}${esc(m.text)}</div>`;
+  }).join("");
   if (prepend) { if (log.querySelector(".empty")) log.innerHTML = ""; log.insertAdjacentHTML("afterbegin", frag); }
   else log.innerHTML = frag;
 }
 
 function esc(s){ return (s==null?"":String(s)).replace(/[&<>]/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;"}[c])); }
-function escAttr(s){ return esc(s).replace(/"/g, "&quot;"); }
 function setSheet(open) {
   $("controlSheet").classList.toggle("open", open);
   $("sheetScrim").classList.toggle("open", open);

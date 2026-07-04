@@ -253,7 +253,7 @@ async def test_observe_adapter_without_video_yields_nothing():
     assert [msg async for msg in adapter.incoming()] == []
 
 
-async def test_observe_adapter_swallows_ingestion_failure():
+async def test_observe_adapter_propagates_ingestion_failure():
     class _ExplodingClient:
         async def messages(self):
             raise YouTubeLiveChatError("chat disabled")
@@ -261,5 +261,7 @@ async def test_observe_adapter_swallows_ingestion_failure():
 
     adapter = ObserveChatAdapter("vid123")
     adapter._client = _ExplodingClient()
-    # Must end quietly, not propagate (a chat failure can't kill the loop).
-    assert [msg async for msg in adapter.incoming()] == []
+    # Chat is a capture channel: an unrecoverable ingestion failure must
+    # propagate so the loop can crash rather than run on silently deaf to chat.
+    with pytest.raises(YouTubeLiveChatError):
+        [msg async for msg in adapter.incoming()]

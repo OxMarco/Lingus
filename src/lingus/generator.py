@@ -39,10 +39,14 @@ class TemplateReplyGenerator:
         # mid-word cut at this layer would defeat the governor's sentence-aware
         # truncation.
         text = self._context_text(snapshot)
-        return self._choose_reply(text, decision, persona)
+        return self._choose_reply(text, decision, persona, snapshot)
 
     def _choose_reply(
-        self, text: str, decision: ArbiterDecision, persona: PersonaSpec
+        self,
+        text: str,
+        decision: ArbiterDecision,
+        persona: PersonaSpec,
+        snapshot: ContextSnapshot,
     ) -> str:
         if "chocolate" in text and "stain" in text:
             return "be careful next time, chocolate stains are hard to remove"
@@ -52,6 +56,14 @@ class TemplateReplyGenerator:
             return "careful, that cleanup arc is about to have lore"
         if "burn" in text or "burnt" in text:
             return "heat management boss fight, apparently"
+        # Talk to people, not only about the stream (deterministic stand-ins for
+        # the LLM's proactive behaviors, so offline replay/eval exercises them).
+        if "curiosity" in decision.reasons:
+            exemplar = self._find_exemplar(persona, "asks the streamer")
+            return exemplar or "wait what made you go with that one"
+        if "chat_engagement" in decision.reasons and snapshot.recent_chat:
+            exemplar = self._find_exemplar(persona, "banters with a chatter")
+            return exemplar or f"@{snapshot.recent_chat[-1].author} ok that's a take"
         if "direct_address" in decision.reasons or "question" in decision.reasons:
             exemplar = self._find_exemplar(persona, "direct question")
             return exemplar or "real answer? probably. but where's the fun in that"

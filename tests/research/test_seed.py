@@ -51,8 +51,26 @@ async def test_seed_research_disabled_writes_nothing(tmp_path):
 @pytest.mark.asyncio
 async def test_seed_research_no_research_flag_skips(tmp_path):
     settings = _settings(tmp_path)
-    await app._seed_research(_args(no_research=True), settings, llm_backend=None)
+    identity, profile = await app._seed_research(
+        _args(no_research=True), settings, llm_backend=None
+    )
     assert not (tmp_path / "semantic.json").exists()
+    # Identity is still resolved: the semantic store needs its cache key to
+    # scope which channel's durable facts this run may surface.
+    assert identity is not None and identity.name == "TestStreamer"
+    assert profile is None
+
+
+@pytest.mark.asyncio
+async def test_seed_research_scopes_facts_to_channel(tmp_path):
+    settings = _settings(tmp_path)
+    identity, _ = await app._seed_research(_args(), settings, llm_backend=None)
+    assert identity is not None
+
+    store = SemanticStore()
+    store.load_file(settings.memory.semantic_path)
+    channels = {f.channel for f in store._facts}  # noqa: SLF001 - test introspection
+    assert channels == {identity.cache_key()}
 
 
 @pytest.mark.asyncio

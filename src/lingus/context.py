@@ -28,6 +28,7 @@ class ContextSnapshot:
     episodic: str = ""  # the running "stream so far" narrative
     episodic_history: list[str] = field(default_factory=list)  # prior stream summaries
     semantic_facts: list[str] = field(default_factory=list)  # durable cross-stream facts
+    promo_hint: str = ""  # optional, relevance-gated product cue (see promotions.py)
 
     def scene_summary(self) -> str:
         parts = [
@@ -47,19 +48,20 @@ class ContextSnapshot:
         own_messages = "\n".join(f"- {text}" for text in self.own_messages)
         history = "\n".join(f"- {summary}" for summary in self.episodic_history)
         facts = "\n".join(f"- {fact}" for fact in self.semantic_facts)
-        return "\n".join(
-            [
-                "Current stream context:",
-                f"Known facts:\n{facts or '- none yet'}",
-                f"Past stream memories:\n{history or '- none yet'}",
-                f"Stream so far: {self.episodic or 'just started'}",
-                f"Scene: {self.scene_summary() or 'unknown'}",
-                f"Recent speech: {self.transcript or 'none'}",
-                f"Recent chat:\n{chat or '- none'}",
-                f"Recent bot messages:\n{own_messages or '- none'}",
-                f"Reply trigger: {self.latest_event_summary() or 'none'}",
-            ]
-        )
+        sections = [
+            "Current stream context:",
+            f"Known facts:\n{facts or '- none yet'}",
+            f"Past stream memories:\n{history or '- none yet'}",
+            f"Stream so far: {self.episodic or 'just started'}",
+            f"Scene: {self.scene_summary() or 'unknown'}",
+            f"Recent speech: {self.transcript or 'none'}",
+            f"Recent chat:\n{chat or '- none'}",
+            f"Recent bot messages:\n{own_messages or '- none'}",
+            f"Reply trigger: {self.latest_event_summary() or 'none'}",
+        ]
+        if self.promo_hint:
+            sections.append(f"Promotion cue: {self.promo_hint}")
+        return "\n".join(sections)
 
 
 def build_context_snapshot(

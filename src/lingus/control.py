@@ -26,6 +26,7 @@ if TYPE_CHECKING:
     from .arbiter import SimpleArbiter
     from .config import Settings
     from .generator import ReplyGenerator
+    from .humanizer import Humanizer
     from .output_governor import OutputGovernor
 
 
@@ -74,6 +75,17 @@ class ControlState:
         self.min_seconds_between_posts: float = settings.output.min_seconds_between_posts
         self.posts_per_minute: float = settings.output.posts_per_minute
         self.temperature: float = settings.models.llm.temperature
+        # Humanizer typo pass: how often a long word gets a hand-typed slip.
+        # 0 disables it; the config seeds the baseline (off by default).
+        self.typo_rate: float = (
+            settings.humanizer.typo_rate if settings.humanizer.typo_enabled else 0.0
+        )
+        # Live on/off for promotional plugs. A plug is already context-gated —
+        # relevance triggers plus per-item spacing/stream caps decide *whether*
+        # and *how often* a mention is apt — so this isn't a share dial, just a
+        # master switch: on = plugs may fire when relevant, off = never. The loop
+        # reads it directly each tick; it isn't pushed onto arbiter/governor.
+        self.promo_enabled: bool = True
 
     # --- schema + values (for the frontend) ---
     @staticmethod
@@ -104,6 +116,15 @@ class ControlState:
                 "temperature", "Generator temperature", "float", 0.0, 2.0, 0.05,
                 help="LLM sampling temperature (ignored by the template generator)",
             ),
+            ParamSpec(
+                "typo_rate", "Typo rate", "float", 0.0, 1.0, 0.01,
+                help="Chance a long word gets a hand-typed slip (0 = off)",
+            ),
+            ParamSpec(
+                "promo_enabled", "Promotions enabled", "bool",
+                help="Master on/off for plugs; relevance gating still decides "
+                "whether a plug is apt when on",
+            ),
         ]
         return [s.as_dict() for s in specs]
 
@@ -116,6 +137,8 @@ class ControlState:
             "min_seconds_between_posts": self.min_seconds_between_posts,
             "posts_per_minute": self.posts_per_minute,
             "temperature": self.temperature,
+            "typo_rate": self.typo_rate,
+            "promo_enabled": self.promo_enabled,
             # Derived read-outs so the UI can show what the macro resolved to.
             "_effective_threshold": round(self._effective_threshold(), 3),
             "_effective_cooldown": round(self._effective_cooldown(), 3),
@@ -146,6 +169,7 @@ class ControlState:
         arbiter: SimpleArbiter,
         governor: OutputGovernor,
         reply_generator: ReplyGenerator,
+        humanizer: Humanizer | None = None,
     ) -> None:
         arbiter.fire_threshold = self._effective_threshold()
         arbiter.cooldown_seconds = self._effective_cooldown()
@@ -156,6 +180,11 @@ class ControlState:
         set_temp = getattr(reply_generator, "set_temperature", None)
         if callable(set_temp):
             set_temp(self.temperature)
+        if humanizer is not None:
+            # A live rate of 0 turns the pass off; >0 turns it on regardless of
+            # the config default, so the UI slider is the single source of truth.
+            humanizer.typo_rate = self.typo_rate
+            humanizer.typo_enabled = self.typo_rate > 0.0
 
     def _effective_threshold(self) -> float:
         return self._base_threshold * (_THRESHOLD_SPAN ** (1.0 - 2.0 * self.frequency))

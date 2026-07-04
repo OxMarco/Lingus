@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import math
+import time
 from collections.abc import AsyncIterator
 from typing import Any
 
@@ -104,7 +105,13 @@ class SpectralAudioGate(AudioGateBackend):
         self, window: list[AudioChunk], sample_rate: int
     ) -> AsyncIterator[AudioChunk]:
         pcm = b"".join(chunk.pcm for chunk in window)
+        started = time.perf_counter()
         decision = await asyncio.to_thread(self.classify, pcm, sample_rate)
+        log.debug(
+            "audio gate classify: %.0fms (allow_asr=%s)",
+            (time.perf_counter() - started) * 1000,
+            decision.allow_asr,
+        )
         if decision.allow_asr:
             for chunk in window:
                 yield chunk

@@ -18,7 +18,7 @@ from lingus.persona.schema import Lexicon, PersonaSpec
 
 
 def _persona(**kw):
-    base = dict(name="Gremlin", voice="dry chat goblin")
+    base = dict(name="Lingus", voice="dry chat goblin")
     base.update(kw)
     return PersonaSpec(**base)
 
@@ -68,6 +68,26 @@ async def test_persona_lexicon_rewarded():
     assert voiced.in_character >= plain.in_character
 
 
+@pytest.mark.asyncio
+async def test_trailing_slang_penalized():
+    # "ngl" mid-line is the voice; bolted onto the end it's a bot performing
+    # casualness ("...becomes a boss fight ngl") and must score lower.
+    persona = _persona(lexicon=Lexicon(use=["ngl"]))
+    judge = HeuristicJudge()
+    natural = await judge.score(_sample("ngl that boss fight was clean"), persona, [])
+    bolted = await judge.score(_sample("that boss fight was clean ngl"), persona, [])
+    assert bolted.in_character < natural.in_character
+    assert "trailing slang" in bolted.notes
+    assert "trailing slang" not in natural.notes
+
+
+@pytest.mark.asyncio
+async def test_builtin_trailing_slang_caught_without_persona_lexicon():
+    judge = HeuristicJudge()
+    score = await judge.score(_sample("the snack run is a whole boss fight fr"), _persona(), [])
+    assert "trailing slang" in score.notes
+
+
 # --- HeuristicJudge: not_generic ---
 @pytest.mark.asyncio
 async def test_pure_filler_scores_low_not_generic():
@@ -87,6 +107,27 @@ async def test_grounded_message_scores_higher_not_generic():
     )
     assert grounded.not_generic > 0.8
     assert "grounded" in grounded.notes
+
+
+@pytest.mark.asyncio
+async def test_scene_echo_penalized():
+    # A line built out of the scene state's own words is captioning, not reacting.
+    scene = "snack aisle | three types of giant chips"
+    judge = HeuristicJudge()
+    echo = await judge.score(
+        EvalSample(t=0.0, text="three types of giant chips in the snack aisle",
+                   scene_summary=scene),
+        _persona(),
+        [],
+    )
+    react = await judge.score(
+        EvalSample(t=0.0, text="the chips won, go home everyone", scene_summary=scene),
+        _persona(),
+        [],
+    )
+    assert echo.not_generic < react.not_generic
+    assert "restates the scene" in echo.notes
+    assert "restates the scene" not in react.notes
 
 
 # --- HeuristicJudge: not_repetitive ---
@@ -216,7 +257,7 @@ async def test_evaluate_segment_scores_template_output():
     settings = Settings.model_validate(
         {"platform": "file_replay", "arbiter": {"weights": {"streamer_mishap": 1.1}}}
     )
-    persona = PersonaSpec(name="Gremlin", voice="brief")
+    persona = PersonaSpec(name="Lingus", voice="brief")
     report = await evaluate_segment(settings, persona, "tests/samples/cake", speed=100.0)
 
     assert report.n_posted == 1
@@ -236,7 +277,7 @@ async def test_evaluate_segment_does_not_touch_semantic_file(tmp_path):
             "memory": {"semantic_enabled": True, "semantic_path": str(marker)},
         }
     )
-    persona = PersonaSpec(name="Gremlin", voice="brief")
+    persona = PersonaSpec(name="Lingus", voice="brief")
     await evaluate_segment(settings, persona, "tests/samples/cake", speed=100.0)
     # eval disables semantic memory for reproducibility -> no file written
     assert not marker.exists()

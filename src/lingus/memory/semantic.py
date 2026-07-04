@@ -23,6 +23,7 @@ from typing import TYPE_CHECKING, Protocol
 
 from pydantic import BaseModel, Field
 
+from ._io import atomic_write_text
 from .repetition import _tokens, jaccard, normalize  # noqa: PLC2701 (sibling helper reuse)
 
 if TYPE_CHECKING:
@@ -34,6 +35,7 @@ class SemanticFact:
     text: str
     subject: str = "streamer"  # who/what it's about
     source: str = "stream"  # "stream" | "manual"
+    channel: str = ""  # which channel this fact belongs to ("" = unscoped legacy)
     created_ts: float = 0.0
     updated_ts: float = 0.0
     hits: int = 0  # times retrieved — a cheap popularity signal for eviction
@@ -61,13 +63,31 @@ class FactExtractor(Protocol):
 
 
 class SemanticStore:
-    def __init__(self, *, max_facts: int = 50, dedup_threshold: float = 0.7) -> None:
+    """Durable fact store, optionally scoped to one channel.
+
+    `channel` is the identity of the stream this run is watching (a
+    `ChannelIdentity.cache_key()`). A scoped store only *surfaces* facts tagged
+    with its own channel — facts learned watching Rakai must not be presented
+    as true while watching Spizee — but it still round-trips every channel's
+    facts through the shared JSON file, so other channels' memory survives.
+    An unscoped store (`channel=""`) sees everything (replay/eval, platforms
+    with no resolvable identity)."""
+
+    def __init__(
+        self, *, max_facts: int = 50, dedup_threshold: float = 0.7, channel: str = ""
+    ) -> None:
         self.max_facts = max_facts
         self.dedup_threshold = dedup_threshold
+        self.channel = channel
         self._facts: list[SemanticFact] = []
 
     def __len__(self) -> int:
-        return len(self._facts)
+        return len(self._visible())
+
+    def _visible(self) -> list[SemanticFact]:
+        if not self.channel:
+            return list(self._facts)
+        return [f for f in self._facts if f.channel == self.channel]
 
     def add(
         self,
@@ -83,14 +103,21 @@ class SemanticStore:
         current = time.time() if now is None else now
         cand = _tokens(text)
         norm = normalize(text)
-        for fact in self._facts:
+        # Dedup only within this channel's facts: the same sentence about two
+        # different streamers is two facts, not a reinforcement.
+        for fact in self._visible():
             # Same fact again (verbatim or reworded): reinforce, don't duplicate.
             same = normalize(fact.text) == norm
             if same or jaccard(cand, _tokens(fact.text)) >= self.dedup_threshold:
                 fact.updated_ts = current
                 return fact
         fact = SemanticFact(
-            text=text, subject=subject, source=source, created_ts=current, updated_ts=current
+            text=text,
+            subject=subject,
+            source=source,
+            channel=self.channel,
+            created_ts=current,
+            updated_ts=current,
         )
         self._facts.append(fact)
         self._evict()
@@ -99,11 +126,12 @@ class SemanticStore:
     def retrieve(self, query: str, k: int = 5, *, now: float | None = None) -> list[SemanticFact]:
         """Top-k facts by token overlap with `query`; ties fall back to
         popularity then recency, so we always surface *something* durable."""
-        if not self._facts:
+        visible = self._visible()
+        if not visible:
             return []
         qt = _tokens(query)
         ranked = sorted(
-            self._facts,
+            visible,
             key=lambda f: (jaccard(qt, _tokens(f.text)), f.hits, f.updated_ts),
             reverse=True,
         )
@@ -113,14 +141,18 @@ class SemanticStore:
         return top
 
     def texts(self) -> list[str]:
-        return [f.text for f in self._facts]
+        return [f.text for f in self._visible()]
 
     def _evict(self) -> None:
-        if len(self._facts) <= self.max_facts:
+        # The cap is per channel: this run may only trim its own facts, never
+        # another channel's memory that merely shares the file.
+        visible = self._visible()
+        if len(visible) <= self.max_facts:
             return
         # Drop the least useful first: fewest retrievals, then least recently seen.
-        self._facts.sort(key=lambda f: (f.hits, f.updated_ts))
-        self._facts = self._facts[len(self._facts) - self.max_facts :]
+        visible.sort(key=lambda f: (f.hits, f.updated_ts))
+        drop = {id(f) for f in visible[: len(visible) - self.max_facts]}
+        self._facts = [f for f in self._facts if id(f) not in drop]
 
     # --- persistence (the layer that survives across streams) ---
     def load_file(self, path: str) -> None:
@@ -149,12 +181,13 @@ class SemanticStore:
             fact.text = fact.text.strip()
             if fact.text:
                 facts.append(fact)
-        self._facts = facts[: self.max_facts]
+        self._facts = facts
+        self._evict()
 
     def save_file(self, path: str) -> None:
-        p = Path(path)
-        p.parent.mkdir(parents=True, exist_ok=True)
-        p.write_text(json.dumps({"facts": [asdict(f) for f in self._facts]}, indent=2))
+        atomic_write_text(
+            Path(path), json.dumps({"facts": [asdict(f) for f in self._facts]}, indent=2)
+        )
 
 
 # --- extraction --------------------------------------------------------------

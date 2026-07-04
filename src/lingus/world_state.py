@@ -98,7 +98,7 @@ class WorldState:
     def __init__(
         self,
         event_window: int = 500,
-        transcript_window: int = 40,
+        transcript_window: int = 12,
         self_memory_window: int = 20,
     ) -> None:
         self.events: deque[Event] = deque(maxlen=event_window)

@@ -11,6 +11,7 @@ import argparse
 import asyncio
 import contextlib
 import signal
+import sys
 import time
 from typing import TYPE_CHECKING
 
@@ -28,6 +29,7 @@ from .config import Settings
 from .context import ContextSnapshot, build_context_snapshot
 from .control import ControlState
 from .generator import ReplyGenerator, TemplateReplyGenerator
+from .humanizer import build_humanizer
 from .logging import get_logger, setup_logging
 from .memory import (
     EpisodicArchive,
@@ -38,11 +40,12 @@ from .memory import (
     RepetitionGuard,
     SemanticStore,
 )
-from .models.base import ASRBackend, AudioGateBackend, LLMBackend, ModerationBackend, VLMBackend
+from .models.base import ASRBackend, AudioGateBackend, LLMBackend, VLMBackend
 from .monitor import Monitor, NullMonitor, TickReport
 from .output_governor import OutputGovernor
 from .persona.loader import load_persona
 from .persona.schema import PersonaSpec
+from .promotions import PromoPlan, PromotionPlanner
 from .video import FrameGate, scene_content_changed, scene_event_changed
 from .world_state import Event, SceneState, WorldState, event_summary
 
@@ -50,6 +53,19 @@ if TYPE_CHECKING:
     from .research import ChannelIdentity, ChannelProfile
 
 log = get_logger("lingus.app")
+
+
+class CaptureError(RuntimeError):
+    """A live capture channel died mid-run and could not be recovered.
+
+    Raised by the live ingest tasks when audio, video or chat capture ends
+    unexpectedly (feed dropped, resolved URL expired, protocol broke) while the
+    run was not asked to stop. Speech is the spine of the whole system, so
+    silently running on a dead channel is worse than failing loudly: this feeds
+    the crash path (`_remember_task_failure` -> `request_stop` -> `run()`
+    re-raise) so the operator sees the failure instead of a bot gone quietly
+    deaf/blind/deaf-to-chat.
+    """
 
 
 def build_adapters(
@@ -77,7 +93,24 @@ def build_adapters(
         # are logged not posted — posting needs OAuth and is a later phase.
         chat_video = video if settings.youtube.chat_enabled else None
         return YouTubeCaptureAdapter(video), ObserveChatAdapter(chat_video), None
-    # Twitch adapter arrives in the final phase.
+    if settings.platform == "twitch":
+        from .adapters.twitch import TwitchCaptureAdapter, TwitchChatAdapter
+
+        # --video doubles as the channel selector on Twitch so one CLI flag works
+        # across platforms; config.twitch.channel is the default.
+        channel = video_override or settings.twitch.channel
+        if not channel:
+            raise SystemExit("twitch platform needs --video <channel> or config.twitch.channel")
+        # No token -> the chat adapter self-degrades to a silent observer.
+        token = settings.secrets.twitch_oauth_token if settings.twitch.chat_enabled else ""
+        chat = TwitchChatAdapter(
+            channel, token, post_enabled=settings.twitch.post_enabled
+        )
+        return (
+            TwitchCaptureAdapter(channel, quality=settings.twitch.quality),
+            chat,
+            None,
+        )
     raise SystemExit(f"platform '{settings.platform}' not implemented yet")
 
 
@@ -98,8 +131,8 @@ class BotLoop:
         controls: ControlState | None = None,
         summarizer: EpisodicSummarizer | None = None,
         fact_extractor: FactExtractor | None = None,
-        safety: ModerationBackend | None = None,
         frame_gate: FrameGate | None = None,
+        channel_key: str = "",
     ) -> None:
         self.settings = settings
         self.persona = persona
@@ -111,7 +144,6 @@ class BotLoop:
         self.asr = asr
         self.audio_gate = audio_gate
         self.vlm = vlm
-        self.safety = safety
         self.controls = controls
         self.frame_gate = frame_gate or FrameGate(
             diff_threshold=settings.models.vlm.frame_diff_threshold,
@@ -127,6 +159,9 @@ class BotLoop:
             mood_threshold_gain=settings.arbiter.mood_threshold_gain,
         )
         self.reply_generator = reply_generator or TemplateReplyGenerator()
+        # Relevance-gated, fatigue-capped in-character product mentions. Empty/​
+        # inert unless config.promotions is enabled (see promotions.py).
+        self.promotions = PromotionPlanner(settings.promotions)
         ct = settings.chat_trends
         self.trends = (
             ChatTrendDetector(
@@ -152,6 +187,7 @@ class BotLoop:
             typing_min_seconds=settings.output.typing_min_seconds,
             typing_max_seconds=settings.output.typing_max_seconds,
         )
+        self.humanizer = build_humanizer(settings.humanizer)
         self.repetition = RepetitionGuard(
             similarity_threshold=settings.memory.similarity_threshold,
             fatigue_seconds=settings.memory.fatigue_seconds,
@@ -159,23 +195,38 @@ class BotLoop:
         self.summarizer = summarizer or ExtractiveSummarizer(
             max_chars=settings.memory.episodic_max_chars
         )
+        # Scope durable memory to the channel we're watching: facts and prior-
+        # stream narratives learned on one channel must not surface on another
+        # ("" = unscoped, e.g. replay or a platform with no resolvable identity).
+        self.channel_key = channel_key
         self.episodes = (
-            EpisodicArchive(max_entries=settings.memory.episodic_max_entries)
+            EpisodicArchive(
+                max_entries=settings.memory.episodic_max_entries, channel=channel_key
+            )
             if settings.memory.episodic_enabled
             else None
         )
         self.semantic = (
-            SemanticStore(max_facts=settings.memory.semantic_max_facts)
+            SemanticStore(max_facts=settings.memory.semantic_max_facts, channel=channel_key)
             if settings.memory.semantic_enabled
             else None
         )
         self.fact_extractor = fact_extractor or HeuristicFactExtractor()
-        self.world = WorldState()
+        self.world = WorldState(transcript_window=settings.memory.working_window)
         self._stop = asyncio.Event()
         self._task_error: BaseException | None = None
         self._replay_tasks: list[asyncio.Task[None]] = []
         self._last_tick = time.monotonic()  # for mood decay between ticks
         self._dropped_reply_backoff_until = 0.0
+
+    def _promo_enabled(self) -> bool:
+        """Whether plugs may fire at all this tick (live UI toggle).
+
+        Plug frequency is already bounded by relevance gating plus each item's
+        spacing/​stream caps, so this is a plain master switch rather than a
+        share dial: on = a relevant plug may go out, off = never.
+        """
+        return self.controls is None or self.controls.promo_enabled
 
     async def run(self) -> None:
         tasks: list[asyncio.Task[None]] = []
@@ -196,14 +247,24 @@ class BotLoop:
             # then seed context with a small relevant slice up front.
             if self.episodes is not None:
                 self.episodes.load_file(self.settings.memory.episodic_path)
+                # Resuming the *same* stream we've watched before: rehydrate its
+                # working narrative so consolidation continues it instead of
+                # clobbering the archived summary with a post-restart-only one.
+                # Only for uniquely-identified streams — a different stream by the
+                # same streamer must start with a blank narrative (its facts still
+                # carry over via semantic memory below).
+                if self._stream_is_resumable() and not self.world.episodic_summary.strip():
+                    prior = self.episodes.summary_for(self._stream_memory_id())
+                    if prior:
+                        self.world.set_episodic_summary(prior)
                 self._refresh_episodic_history()
-                log.info("episodic memory: %d stream summaries loaded", len(self.episodes))
+                log.debug("episodic memory: %d stream summaries loaded", len(self.episodes))
             if self.semantic is not None:
                 self.semantic.load_file(self.settings.memory.semantic_path)
                 self.world.semantic_facts = [
                     f.text for f in self.semantic.retrieve("", self.settings.memory.semantic_top_k)
                 ]
-                log.info("semantic memory: %d durable facts loaded", len(self.semantic))
+                log.debug("semantic memory: %d durable facts loaded", len(self.semantic))
 
             chat_task = asyncio.create_task(self._ingest_chat(), name="ingest_chat")
             tasks = [chat_task, asyncio.create_task(self._cognition_loop(), name="cognition")]
@@ -269,6 +330,26 @@ class BotLoop:
     def request_stop(self) -> None:
         self._stop.set()
 
+    def _handle_interrupt(self) -> None:
+        """Signal handler for Ctrl+C / SIGTERM.
+
+        Teardown is slow — it folds pending lines into memory and persists the
+        episodic/semantic archives — so acknowledge the request immediately
+        instead of leaving the user staring at a silent terminal. A second
+        interrupt while we're already stopping forces an immediate exit.
+        """
+        if self._stop.is_set():
+            print("\nForce quitting now.", file=sys.stderr, flush=True)
+            sys.exit(130)
+        print(
+            "\nShutting down — saving memory and finishing in-flight work, "
+            "this may take a moment… (press Ctrl+C again to force quit)",
+            file=sys.stderr,
+            flush=True,
+        )
+        log.info("stop requested; draining and persisting memory before exit")
+        self.request_stop()
+
     def _remember_task_failure(self, task: asyncio.Task[None]) -> None:
         if task.cancelled():
             return
@@ -286,21 +367,31 @@ class BotLoop:
 
     # --- perception -> world state ---
     async def _ingest_chat(self) -> None:
-        async for msg in self.chat.incoming():
-            self.world.add_event(
-                Event(
-                    source="chat",
-                    kind="message",
-                    payload={"author": msg.author, "text": msg.text},
+        try:
+            async for msg in self.chat.incoming():
+                self.world.add_event(
+                    Event(
+                        source="chat",
+                        kind="message",
+                        payload={"author": msg.author, "text": msg.text},
+                    )
                 )
-            )
-            if self.trends is not None:
-                # Feed the pile-on detector. The bot's own echoes never reach here
-                # (they go through record_own_message, not the chat ingest), so a
-                # mirror can't re-trigger itself. A platform that loops the bot's
-                # posts back in would need to filter them by author at the adapter.
-                self.trends.observe(msg.author, msg.text, time.monotonic())
-            log.debug("chat %s: %s", msg.author, msg.text)
+                if self.trends is not None:
+                    # Feed the pile-on detector. The bot's own echoes never reach here
+                    # (they go through record_own_message, not the chat ingest), so a
+                    # mirror can't re-trigger itself. A platform that loops the bot's
+                    # posts back in would need to filter them by author at the adapter.
+                    self.trends.observe(msg.author, msg.text, time.monotonic())
+                log.debug("chat %s: %s", msg.author, msg.text)
+        except Exception:
+            # Chat is a capture channel: an unrecoverable failure must crash the
+            # run, not silently degrade to speech-only (the adapter no longer
+            # swallows it). During a requested shutdown the feed is torn down
+            # under us, so a late error there is expected noise, not a failure.
+            if self._stop.is_set():
+                log.debug("chat ingestion interrupted during shutdown")
+                return
+            raise
 
     async def _ingest_audio_asr(self) -> None:
         """Live: pull captured audio through ASR into the world state."""
@@ -315,6 +406,12 @@ class BotLoop:
                 continue
             self.world.add_event(Event(source="speech", kind="transcript", payload={"text": text}))
             log.info("ASR: %s", text)
+        # transcribe_stream only ends when capture hit EOF. Live audio has no
+        # clean mid-run end: the feed dropped (connection lost / URL expired) and
+        # ffmpeg could not reconnect. Speech is the spine — crash rather than run
+        # on deaf.
+        if self._live_capture_lost():
+            raise CaptureError("audio capture ended unexpectedly")
 
     async def _ingest_transcript(self) -> None:
         """Phase-0 convenience: replay pre-transcribed speech (stands in for ASR)."""
@@ -342,11 +439,10 @@ class BotLoop:
             if not self.frame_gate.accept(frame):
                 continue
             prev_scene = self.world.scene
-            try:
-                scene = await self.vlm.describe_change(frame, prev_scene)
-            except Exception as exc:
-                log.warning("video scene analysis failed; keeping prior scene: %s", exc)
-                continue
+            # No silent degradation: a VLM failure (e.g. mlx_vlm cannot load /
+            # no visible Metal device) is fatal. Let it propagate so the task
+            # supervisor stops the run instead of limping on a stale scene.
+            scene = await self.vlm.describe_change(frame, prev_scene)
             if not scene_content_changed(prev_scene, scene):
                 log.debug("scene unchanged after VLM frame at %.2fs", frame.ts)
                 continue
@@ -358,6 +454,10 @@ class BotLoop:
                 Event(source="scene", kind="scene_change", payload=_scene_payload(scene))
             )
             log.info("scene: %s", event_summary(self.world.last_event()))
+        # video_frames ends only on capture EOF; a live feed that stops mid-run
+        # is an unrecoverable drop, not a clean end.
+        if self._live_capture_lost():
+            raise CaptureError("video capture ended unexpectedly")
 
     # --- cognition ---
     async def _cognition_loop(self) -> None:
@@ -370,6 +470,16 @@ class BotLoop:
             # stop once the sources have completed.
             if self._replay_should_stop():
                 self.request_stop()
+
+    def _live_capture_lost(self) -> bool:
+        """Whether a live capture stream ending mid-run is an unrecoverable loss.
+
+        Offline replay ends cleanly when the segment is exhausted (the replay-stop
+        logic handles that graceful shutdown), and a requested shutdown cancels
+        these tasks before their streams matter — neither should crash. Anything
+        else means a live feed dropped and could not be recovered.
+        """
+        return self.settings.platform != "file_replay" and not self._stop.is_set()
 
     def _replay_exhausted(self) -> bool:
         return bool(self._replay_tasks) and all(task.done() for task in self._replay_tasks)
@@ -420,6 +530,13 @@ class BotLoop:
                 facts = []
             for ef in facts:
                 self.semantic.add(ef.text, ef.subject)
+            if facts:
+                # Persist as we learn, not only on graceful shutdown: a hard kill
+                # (crash, SIGKILL, force-quit) must not lose this session's facts
+                # while episodic summaries — saved incrementally — advance without
+                # them, leaving the two layers out of sync on the next boot.
+                with contextlib.suppress(OSError):
+                    self.semantic.save_file(self.settings.memory.semantic_path)
             # Refresh the facts surfaced into context against the current moment.
             self.world.semantic_facts = [
                 f.text
@@ -434,7 +551,23 @@ class BotLoop:
         video = self.settings.youtube.video_id
         if self.settings.platform == "youtube" and video:
             return f"youtube:{video}"
+        channel = self.settings.twitch.channel
+        if self.settings.platform == "twitch" and channel:
+            return f"twitch:{channel.strip().lstrip('@').lower()}"
         return f"{self.settings.platform}:live"
+
+    def _stream_is_resumable(self) -> bool:
+        """Whether the current stream id uniquely identifies *this* stream.
+
+        The `{platform}:live` fallback (no segment, no video id) is a shared
+        placeholder across every live stream by the same streamer — so its
+        archived narrative must NOT be rehydrated, or one stream's "stream so
+        far" would bleed into an unrelated later stream. Streamer *facts*
+        (semantic memory) carry over regardless; only the per-stream episodic
+        narrative is gated here."""
+        if self.segment:
+            return True
+        return self.settings.platform == "youtube" and bool(self.settings.youtube.video_id)
 
     def _persist_episodic_summary(self) -> None:
         if self.episodes is None or not self.world.episodic_summary.strip():
@@ -467,7 +600,9 @@ class BotLoop:
         # Live tuning: push the latest web-UI knob values onto the arbiter,
         # governor and generator before we score this tick.
         if self.controls is not None:
-            self.controls.apply(self.arbiter, self.governor, self.reply_generator)
+            self.controls.apply(
+                self.arbiter, self.governor, self.reply_generator, self.humanizer
+            )
         self._decay_mood()
         # Trend mirror runs *before* the arbiter/generator path: a cresting pile-on
         # is its own decision, joined verbatim. If we follow one this tick, we've
@@ -476,11 +611,22 @@ class BotLoop:
             return
         snapshot = build_context_snapshot(self.world)
         seconds_since_own = self.world.seconds_since_own_message()
+        # A plug only exists this tick if some item is both relevant to the live
+        # context and off cooldown/​under its cap. When present it adds a little
+        # salience (below) and hands the generator an optional in-voice cue.
+        plan = self.promotions.plan(snapshot, time.monotonic())
+        if plan is not None and not self._promo_enabled():
+            # Plugs switched off live (UI toggle): let this tick be a normal
+            # reaction rather than a plug.
+            plan = None
+        if plan is not None:
+            snapshot.promo_hint = plan.hint()
         decision = self.arbiter.decide(
             snapshot,
             persona_name=self.persona.name,
             seconds_since_own_message=seconds_since_own,
             mood=self.persona.mood.value,
+            promo_salience=plan.salience if plan is not None else 0.0,
         )
         log.debug(
             "tick: %d events, score=%.2f/thr=%.2f mood=%.2f reasons=%s transcript=%r",
@@ -492,13 +638,17 @@ class BotLoop:
             self.world.recent_transcript(3),
         )
         self._nudge_mood(decision)
-        posted, dropped = await self._maybe_reply(snapshot, decision)
-        self._emit_tick(decision, snapshot, posted=posted, dropped=dropped)
+        posted, dropped = await self._maybe_reply(snapshot, decision, plan)
+        # A posted line generated under an active plug carries that item's arm
+        # label, so the eval harness can score preference-steering per condition.
+        condition = plan.item.condition if (plan is not None and posted is not None) else ""
+        self._emit_tick(decision, snapshot, posted=posted, dropped=dropped, condition=condition)
 
     async def _maybe_reply(
         self,
         snapshot: ContextSnapshot,
         decision: ArbiterDecision,
+        plan: PromoPlan | None = None,
     ) -> tuple[str | None, str | None]:
         """Generate, run a cheap staleness check, and post.
 
@@ -531,17 +681,6 @@ class BotLoop:
             )
         if not reply:
             return None, None
-        # Safety pre-check with one regeneration: unlike the trend mirror (a
-        # verbatim copy that can only be dropped), a generated reply that trips
-        # moderation gets a second draft before we give up. The authoritative
-        # gate still lives in _post_message; this just spares a salvageable reply.
-        if self.safety is not None and not (await self.safety.check(reply)).allowed:
-            log.info("reply failed safety; regenerating once: %s", reply)
-            reply = await self.reply_generator.generate(
-                snapshot, decision, self.persona, max_chars=self.settings.output.max_chars
-            )
-            if not reply:
-                return None, None
         # Self-memory dedup + bit-fatigue: drop a reply that repeats (verbatim or
         # reworded) something the bot said recently, or that leans on a spent
         # catchphrase. Repetition is the #1 immersion-killer (CLAUDE.md §5).
@@ -561,6 +700,7 @@ class BotLoop:
             persona_name=self.persona.name,
             seconds_since_own_message=self.world.seconds_since_own_message(),
             mood=self.persona.mood.value,
+            promo_salience=plan.salience if plan is not None else 0.0,
         )
         if not recheck.should_reply or recheck.trigger_event is not decision.trigger_event:
             return self._drop_generated_reply(reply, "stale")
@@ -568,6 +708,9 @@ class BotLoop:
         posted, dropped = await self._post_message(reply, drop_context="reply")
         if posted is not None:
             log.info("bot replied: %s", posted)
+            if plan is not None:
+                # Spend the plug's per-stream cap and reset its spacing timer.
+                self.promotions.note_plugged(plan.item, time.monotonic())
         elif dropped is not None:
             self._set_dropped_reply_backoff()
         return posted, dropped
@@ -614,7 +757,9 @@ class BotLoop:
             return None
 
         self.world.chat.trend = trend  # observability
-        posted, dropped = await self._post_message(trend.message, drop_context="trend mirror")
+        posted, dropped = await self._post_message(
+            trend.message, drop_context="trend mirror", humanize_typos=False
+        )
         if posted is None:
             self._report_trend_tick(trend, posted=None, dropped=dropped)
             return None
@@ -635,20 +780,18 @@ class BotLoop:
         text: str,
         *,
         drop_context: str,
+        humanize_typos: bool = True,
     ) -> tuple[str | None, str | None]:
         """Run the final deterministic post path and update self-memory on success.
 
-        Order — safety first: an unsafe line must never post even if the governor
-        would rate-limit it away this tick anyway. This is the last, authoritative
-        moderation gate (CLAUDE.md §9); the generated-reply path may pre-check and
-        regenerate upstream, but everything (incl. verbatim trend mirrors) is
-        re-checked here so nothing slips through a bypass.
+        The humanizer runs first so it is the single, authoritative place AI-tell
+        punctuation is stripped (covering generated replies AND verbatim trend
+        mirrors), and so the governor's length cap operates on the exact string
+        that will be posted. Typos are gated to the bot's own voice
+        (`humanize_typos=False` for verbatim mirrors) so a mirrored emote is never
+        mangled into something that won't render.
         """
-        if self.safety is not None:
-            verdict = await self.safety.check(text)
-            if not verdict.allowed:
-                log.warning("safety dropped %s (%s): %s", drop_context, verdict.reason, text)
-                return None, f"⚠ unsafe ({verdict.reason})"
+        text = self.humanizer.humanize(text, introduce_typos=humanize_typos)
         outcome = self.governor.admit(text)
         if outcome.action == "drop":
             log.info("governor dropped %s (%s): %s", drop_context, outcome.reason, text)
@@ -683,6 +826,7 @@ class BotLoop:
         *,
         posted: str | None,
         dropped: str | None,
+        condition: str = "",
     ) -> None:
         self.monitor.on_tick(
             self._build_tick_report(
@@ -690,6 +834,7 @@ class BotLoop:
                 snapshot,
                 posted=posted,
                 dropped=dropped,
+                condition=condition,
             )
         )
 
@@ -700,6 +845,7 @@ class BotLoop:
         *,
         posted: str | None,
         dropped: str | None,
+        condition: str = "",
     ) -> TickReport:
         return TickReport(
             t=time.monotonic(),
@@ -714,6 +860,7 @@ class BotLoop:
             scene_summary=snapshot.scene_summary(),
             posted=posted,
             dropped=dropped,
+            condition=condition,
         )
 
     def _decay_mood(self) -> None:
@@ -786,22 +933,6 @@ def _build_monitor(
     return RichDashboard(persona.name, platform)
 
 
-def _build_safety(settings: Settings) -> ModerationBackend | None:
-    """The moderation gate. Off only when config says so — and then loudly,
-    because observe-mode tuning is the only legitimate reason to run without it."""
-    from .safety import build_moderation
-
-    safety = build_moderation(settings)
-    if safety is None:
-        log.warning(
-            "moderation DISABLED (moderation.backend=%s) — safe only for offline tuning",
-            settings.models.moderation.backend,
-        )
-    else:
-        log.info("moderation: %s", settings.models.moderation.backend)
-    return safety
-
-
 def _build_asr(settings: Settings) -> ASRBackend | None:
     """Live audio needs ASR; file replay ships its own pre-transcribed text."""
     if settings.platform == "file_replay":
@@ -861,32 +992,16 @@ def _build_vlm(settings: Settings) -> VLMBackend | None:
     if cfg.backend in ("", "none"):
         return None
     if cfg.backend == "mlx_vlm":
-        from .models.local_vision import LocalFrameAnalyzer, MLXVLMSceneAnalyzer
+        from .models.local_vision import MLXVLMSceneAnalyzer
 
-        fallback = (
-            LocalFrameAnalyzer(
-                max_sample_pixels=cfg.max_sample_pixels,
-                brightness_change_threshold=cfg.brightness_change_threshold,
-                contrast_change_threshold=cfg.contrast_change_threshold,
-            )
-            if cfg.fallback_to_local_cv
-            else None
-        )
+        # No fallback: colour-only analysis is useless for scene understanding
+        # and silently degrading to it hides a broken VLM. If mlx_vlm cannot
+        # load, describe_change raises and the run terminates.
         log.info("vlm: local mlx_vlm (%s)", cfg.model)
         return MLXVLMSceneAnalyzer(
             model=cfg.model,
             max_tokens=cfg.max_tokens,
             temperature=cfg.temperature,
-            fallback=fallback,
-        )
-    if cfg.backend == "local_cv":
-        from .models.local_vision import LocalFrameAnalyzer
-
-        log.info("vlm: local_cv frame analyzer")
-        return LocalFrameAnalyzer(
-            max_sample_pixels=cfg.max_sample_pixels,
-            brightness_change_threshold=cfg.brightness_change_threshold,
-            contrast_change_threshold=cfg.contrast_change_threshold,
         )
     raise SystemExit(f"vlm backend '{cfg.backend}' not implemented")
 
@@ -961,9 +1076,14 @@ async def _seed_research(
     persists it — so `BotLoop.run()` then loads them like any other durable fact
     and surfaces them into the generator's context. Entirely best-effort: a
     research failure logs and returns, it never blocks the stream from starting.
+
+    Identity is resolved even when web research itself is skipped
+    (`--no-research` / `research.enabled: false`): the semantic store is scoped
+    by the identity's cache key, and without it a run would fall back to the
+    unscoped store and surface other channels' facts.
     """
     cfg = settings.research
-    if args.no_research or not cfg.enabled or not settings.memory.semantic_enabled:
+    if not settings.memory.semantic_enabled:
         return None, None
     from .research import research_channel, resolve_identity
 
@@ -974,6 +1094,8 @@ async def _seed_research(
     if identity is None:
         log.info("research: no channel to research (set research.channel for this platform)")
         return None, None
+    if args.no_research or not cfg.enabled:
+        return identity, None
     log.info("research: profiling channel '%s' (%s)", identity.name, identity.platform)
     profile = await research_channel(
         identity,
@@ -989,7 +1111,9 @@ async def _seed_research(
     if profile is None or not profile.facts:
         log.info("research: no facts produced for '%s'", identity.name)
         return identity, profile
-    store = SemanticStore(max_facts=settings.memory.semantic_max_facts)
+    store = SemanticStore(
+        max_facts=settings.memory.semantic_max_facts, channel=identity.cache_key()
+    )
     store.load_file(settings.memory.semantic_path)
     before = len(store)
     for fact in profile.facts:
@@ -1033,15 +1157,13 @@ def _stream_info(
         or _live_url(platform, args.video or settings.youtube.video_id, settings.research.channel)
     )
     summary = str(getattr(profile, "summary", "") or "")
-    facts = [str(f) for f in getattr(profile, "facts", [])]
-    source_urls = [str(u) for u in getattr(profile, "source_urls", [])]
+    # The web UI shows only a brief prose paragraph about the streamer — no fact
+    # list, no source URLs (those leak raw links into the panel and overflow).
     return {
         "nickname": nickname,
         "platform": platform,
         "live_url": live_url,
         "summary": summary,
-        "facts": facts,
-        "source_urls": source_urls,
     }
 
 
@@ -1084,6 +1206,14 @@ async def _amain(args: argparse.Namespace) -> None:
     settings = Settings.load(args.config)
     if args.platform:
         settings.platform = args.platform
+    # `--video` is the effective stream identity; fold it into settings so every
+    # downstream consumer (capture/chat adapters, cold-start research, and the
+    # per-stream memory id) reads one source of truth. Without this,
+    # _stream_memory_id() falls back to the generic "youtube:live" bucket, so
+    # distinct streams overwrite each other's episodic summary and can never
+    # surface as "past stream memories".
+    if args.video:
+        settings.youtube.video_id = args.video
     # The dashboard owns the terminal, so send logs to a file while it runs.
     setup_logging(
         settings.logging.level,
@@ -1118,7 +1248,6 @@ async def _amain(args: argparse.Namespace) -> None:
     asr = _build_asr(settings)
     audio_gate = _build_audio_gate(settings) if asr is not None else None
     vlm = _build_vlm(settings)
-    safety = _build_safety(settings)
     llm_backend = _build_llm_backend(settings)
     reply_generator = _build_generator(settings, llm_backend)
     summarizer = _build_summarizer(settings, llm_backend)
@@ -1154,13 +1283,13 @@ async def _amain(args: argparse.Namespace) -> None:
         controls=controls,
         summarizer=summarizer,
         fact_extractor=fact_extractor,
-        safety=safety,
+        channel_key=identity.cache_key() if identity else "",
     )
 
     running = asyncio.get_running_loop()
     for sig in (signal.SIGINT, signal.SIGTERM):
         with contextlib.suppress(NotImplementedError):
-            running.add_signal_handler(sig, loop.request_stop)
+            running.add_signal_handler(sig, loop._handle_interrupt)
 
     await loop.run()
 
@@ -1169,7 +1298,11 @@ def main() -> None:
     parser = argparse.ArgumentParser(prog="lingus")
     parser.add_argument("--config", default=None, help="path to config.yaml")
     parser.add_argument("--segment", default=None, help="recorded segment dir (file_replay)")
-    parser.add_argument("--video", default=None, help="youtube video id or URL (youtube platform)")
+    parser.add_argument(
+        "--video",
+        default=None,
+        help="youtube video id/URL (youtube) or channel name/URL (twitch)",
+    )
     parser.add_argument(
         "--platform",
         default=None,
@@ -1206,7 +1339,7 @@ def main() -> None:
     parser.add_argument(
         "--vlm-backend",
         default=None,
-        choices=["none", "local_cv", "mlx_vlm"],
+        choices=["none", "mlx_vlm"],
         help="override video scene backend for this run",
     )
     parser.add_argument("--vlm-model", default=None, help="override local MLX-VLM model name")

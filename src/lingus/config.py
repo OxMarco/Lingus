@@ -27,6 +27,10 @@ class Secrets(BaseSettings):
     openai_base_url: str = Field(default="", alias="OPENAI_BASE_URL")
     youtube_client_secrets: str = Field(default="", alias="YOUTUBE_CLIENT_SECRETS")
     youtube_token_path: str = Field(default=".youtube_token.json", alias="YOUTUBE_TOKEN_PATH")
+    # Twitch chat OAuth token (chat scope). Reads and posts both need it; without
+    # it the Twitch chat adapter runs as a silent observer. May include the
+    # `oauth:` prefix or not — twitchio accepts either.
+    twitch_oauth_token: str = Field(default="", alias="TWITCH_OAUTH_TOKEN")
     config_path: str = Field(default="config.yaml", alias="LINGUS_CONFIG")
 
 
@@ -39,6 +43,19 @@ class YouTubeConfig(BaseModel):
     video_id: str = ""
     # Read the live chat (keyless InnerTube reader). Off = speech-only observe.
     chat_enabled: bool = True
+
+
+class TwitchConfig(BaseModel):
+    # Bare channel login, @handle, or full twitch.tv URL of the stream to watch.
+    channel: str = ""
+    # streamlink quality selector for A/V capture ("best", "worst", "720p", ...).
+    quality: str = "best"
+    # Read the live chat via twitchio (needs TWITCH_OAUTH_TOKEN). Off = observe.
+    chat_enabled: bool = True
+    # Actually POST replies to chat (needs the token + a bot account). Default
+    # off: like YouTube observe mode, react to a real chat while only logging
+    # what we would say, so running against a channel never writes uninvited.
+    post_enabled: bool = False
 
 
 class ASRConfig(BaseModel):
@@ -75,37 +92,23 @@ class AudioGateConfig(BaseModel):
 
 class LLMConfig(BaseModel):
     backend: str = "openai_compat"
-    model: str = "gpt-5.5"
-    temperature: float = 0.9
+    model: str = "gpt-5.4-mini"
+    temperature: float = 0.7
     max_tokens: int = 120
 
 
 class VLMConfig(BaseModel):
-    # "mlx_vlm" = local Apple Silicon VLM via mlx-vlm; "local_cv" = cheap local
-    # frame analysis fallback; "none" disables live video.
+    # "mlx_vlm" = local Apple Silicon VLM via mlx-vlm; "none" disables live video.
+    # There is no silent fallback: if mlx_vlm cannot load (e.g. no visible Metal
+    # device), the run terminates rather than degrading to colour-only analysis.
     backend: str = "mlx_vlm"
     model: str = "mlx-community/Qwen2.5-VL-3B-Instruct-4bit"
     max_tokens: int = Field(default=180, gt=0)
     temperature: float = Field(default=0.0, ge=0.0)
-    fallback_to_local_cv: bool = True
     # Phase 4 frame gate: how different a sampled RGB frame must be from the
-    # last accepted frame before local analysis runs again.
+    # last accepted frame before scene analysis runs again.
     frame_diff_threshold: float = Field(default=0.08, ge=0.0, le=1.0)
     frame_min_interval_seconds: float = Field(default=3.0, ge=0.0)
-    max_sample_pixels: int = Field(default=4096, ge=1)
-    brightness_change_threshold: float = Field(default=0.16, ge=0.0, le=1.0)
-    contrast_change_threshold: float = Field(default=0.10, ge=0.0, le=1.0)
-
-
-class ModerationConfig(BaseModel):
-    # "regex" = deterministic filter (see lingus/safety.py); "none" disables the
-    # gate (offline replay tuning only — real posting must keep it on).
-    backend: str = "regex"
-    # Per-deployment additions to the built-in denylist (raw regexes).
-    extra_patterns: list[str] = Field(default_factory=list)
-    # Spam-shape detection (link floods, scam CTAs). Independent of the slur
-    # denylist so a link-friendly persona isn't muzzled.
-    check_spam: bool = True
 
 
 class ModelsConfig(BaseModel):
@@ -113,7 +116,6 @@ class ModelsConfig(BaseModel):
     audio_gate: AudioGateConfig = Field(default_factory=AudioGateConfig)
     llm: LLMConfig = Field(default_factory=LLMConfig)
     vlm: VLMConfig = Field(default_factory=VLMConfig)
-    moderation: ModerationConfig = Field(default_factory=ModerationConfig)
 
 
 class PersonaConfig(BaseModel):
@@ -142,6 +144,42 @@ class ChatTrendsConfig(BaseModel):
     cooldown_seconds: float = Field(default=20.0, ge=0.0)  # min gap between any two follows
 
 
+class PromotionItem(BaseModel):
+    """One thing the bot may work into chat, in-character, when it's relevant.
+
+    A plug is never a timed interrupt: it only adds salience — and only reaches
+    the generator — when the *live* context already brushes against one of its
+    `triggers`. It rides the normal arbiter → generator → governor path
+    and is spaced/​capped so it can't dominate. See lingus/promotions.py.
+    """
+
+    subject: str  # what's plugged, handed to the generator as an optional cue
+    triggers: list[str] = Field(default_factory=list)  # keywords that make it relevant now
+    hint: str = ""  # optional extra steer ("the smooth finish"); may stay empty
+    weight: float = Field(default=0.6, ge=0.0)  # salience added when relevant
+    max_per_stream: int = Field(default=3, ge=0)  # hard cap per run (0 = unlimited)
+    min_interval_seconds: float = Field(default=180.0, ge=0.0)  # spacing between plugs
+    # Free-form experiment-arm label stamped on every line generated under this
+    # plug (e.g. "open_plug", "tagged_plug"), so the eval harness can score
+    # preference-steering per condition. Baseline/control = run with promotions
+    # disabled; those lines carry an empty condition.
+    condition: str = ""
+
+
+class PromotionsConfig(BaseModel):
+    """Relevance-gated product mentions worked into chat in-character.
+
+    Promotion obeys the same discipline as everything else the bot says:
+    perception-triggered (fires only when the context is already relevant),
+    fatigue/​interval-capped, routed through the persona voice and the
+    output governor — never a timed ad read. Enabled by default, but inert
+    until `items` are configured — an empty list means no plug can ever fire.
+    """
+
+    enabled: bool = True
+    items: list[PromotionItem] = Field(default_factory=list)
+
+
 class MemoryConfig(BaseModel):
     """Self-memory dedup + bit-fatigue (see lingus/memory/repetition.py)."""
 
@@ -149,9 +187,14 @@ class MemoryConfig(BaseModel):
     similarity_threshold: float = Field(default=0.6, ge=0.0, le=1.0)
     # How long a catchphrase stays "spent" after the bot leans on it.
     fatigue_seconds: float = Field(default=180.0, ge=0.0)
+    # Working (short-term) memory: how many transcript lines the rolling window
+    # holds before the oldest evict into the episodic layer. Kept small so the
+    # "stream so far" narrative starts building early rather than after dozens of
+    # lines; the generator's prompt only ever reads the last few turns anyway.
+    working_window: int = Field(default=12, ge=1)
     # Episodic memory: fold evicted transcript lines into a "stream so far" digest.
     episodic_enabled: bool = True
-    episodic_batch_lines: int = Field(default=8, ge=1)  # summarize once this many pile up
+    episodic_batch_lines: int = Field(default=4, ge=1)  # summarize once this many pile up
     episodic_max_chars: int = Field(default=800, gt=0)  # cap on the running narrative
     episodic_path: str = ".lingus/episodes.json"  # per-stream summaries across runs
     episodic_max_entries: int = Field(default=20, ge=1)
@@ -207,6 +250,24 @@ class OutputConfig(BaseModel):
     typing_max_seconds: float = Field(default=7.0, gt=0.0)
 
 
+class HumanizerConfig(BaseModel):
+    """Deterministic punctuation pass that strips AI-tell typography before posting."""
+
+    enabled: bool = True
+    # What to substitute for an em-dash (or spaced en-dash) clause break. A comma
+    # reads as the most natural human substitute; set to " - " for a spaced hyphen.
+    em_dash_replacement: str = ", "
+    straighten_quotes: bool = True  # “smart” quotes -> straight quotes
+    normalize_ellipsis: bool = True  # single-glyph … -> ...
+    # Opt-in typo pass: transpose two adjacent letters of a long word now and
+    # then so replies read as hand-typed. Off by default; rate is live-tunable
+    # from the web UI. Only touches the bot's own replies, never mirrored chat.
+    typo_enabled: bool = False
+    typo_rate: float = Field(default=0.0, ge=0.0, le=1.0)  # per-eligible-word chance
+    typo_min_word_len: int = Field(default=7, ge=4)  # only long/complex words
+    typo_max_per_message: int = Field(default=2, ge=0)  # cap so it never reads garbled
+
+
 class LoggingConfig(BaseModel):
     model_config = ConfigDict(populate_by_name=True)
 
@@ -219,13 +280,16 @@ class Settings(BaseModel):
     platform: Literal["youtube", "twitch", "file_replay"] = "file_replay"
     file_replay: FileReplayConfig = Field(default_factory=FileReplayConfig)
     youtube: YouTubeConfig = Field(default_factory=YouTubeConfig)
+    twitch: TwitchConfig = Field(default_factory=TwitchConfig)
     models: ModelsConfig = Field(default_factory=ModelsConfig)
     persona: PersonaConfig = Field(default_factory=PersonaConfig)
     arbiter: ArbiterConfig = Field(default_factory=ArbiterConfig)
+    promotions: PromotionsConfig = Field(default_factory=PromotionsConfig)
     chat_trends: ChatTrendsConfig = Field(default_factory=ChatTrendsConfig)
     memory: MemoryConfig = Field(default_factory=MemoryConfig)
     research: ResearchConfig = Field(default_factory=ResearchConfig)
     output: OutputConfig = Field(default_factory=OutputConfig)
+    humanizer: HumanizerConfig = Field(default_factory=HumanizerConfig)
     logging: LoggingConfig = Field(default_factory=LoggingConfig)
 
     # Populated from Secrets at load time, not from YAML.

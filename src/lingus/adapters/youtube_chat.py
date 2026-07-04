@@ -322,7 +322,7 @@ class YouTubeLiveChatClient:
                     if not history:
                         yield message
                 if history:
-                    log.info("skipped %d backlog chat messages", len(messages))
+                    log.debug("skipped %d backlog chat messages", len(messages))
                     history = False
                 if continuation:
                     refreshed = False  # healthy again; re-arm the one-shot refresh

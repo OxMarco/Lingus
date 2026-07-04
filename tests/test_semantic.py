@@ -40,6 +40,90 @@ def test_eviction_keeps_most_used_facts():
     assert len(texts) == 2
 
 
+def test_scoped_store_hides_other_channels_facts(tmp_path):
+    path = str(tmp_path / "sem.json")
+    rakai = SemanticStore(channel="youtube_rakai")
+    rakai.add("the streamer's channel is Rakai Live", now=1.0)
+    rakai.save_file(path)
+
+    spizee = SemanticStore(channel="youtube_spizee")
+    spizee.load_file(path)
+    spizee.add("the streamer's channel is Spizee 2", now=2.0)
+
+    assert spizee.texts() == ["the streamer's channel is Spizee 2"]
+    assert len(spizee) == 1
+    assert all(f.text != "the streamer's channel is Rakai Live" for f in spizee.retrieve("", k=5))
+
+
+def test_scoped_store_hides_legacy_unscoped_facts():
+    s = SemanticStore()  # unscoped, like pre-channel-tagging data
+    s.add("the streamer's channel is Rakai Live", now=1.0)
+    s.channel = "youtube_spizee"
+    assert s.texts() == []
+
+
+def test_unscoped_store_sees_all_channels(tmp_path):
+    path = str(tmp_path / "sem.json")
+    rakai = SemanticStore(channel="youtube_rakai")
+    rakai.add("fact about rakai", now=1.0)
+    rakai.save_file(path)
+
+    unscoped = SemanticStore()
+    unscoped.load_file(path)
+    unscoped.add("unscoped fact", now=2.0)
+    assert sorted(unscoped.texts()) == ["fact about rakai", "unscoped fact"]
+
+
+def test_dedup_is_per_channel(tmp_path):
+    path = str(tmp_path / "sem.json")
+    text = "the streamer loves spicy food"
+    a = SemanticStore(channel="chan_a")
+    a.add(text, now=1.0)
+    a.save_file(path)
+
+    b = SemanticStore(channel="chan_b")
+    b.load_file(path)
+    b.add(text, now=2.0)  # same words, different streamer -> a second fact
+    b.save_file(path)
+
+    merged = SemanticStore()
+    merged.load_file(path)
+    assert merged.texts() == [text, text]
+
+
+def test_eviction_only_trims_own_channel(tmp_path):
+    path = str(tmp_path / "sem.json")
+    other = SemanticStore(channel="chan_a", max_facts=5)
+    other.add("fact about apples", now=1.0)
+    other.add("fact about bananas", now=2.0)
+    other.save_file(path)
+
+    mine = SemanticStore(channel="chan_b", max_facts=1)
+    mine.load_file(path)
+    mine.add("fact about cherries", now=3.0)
+    mine.add("fact about dates", now=4.0)  # over chan_b's cap -> evict cherries only
+    mine.save_file(path)
+
+    merged = SemanticStore()
+    merged.load_file(path)
+    assert sorted(merged.texts()) == [
+        "fact about apples",
+        "fact about bananas",
+        "fact about dates",
+    ]
+
+
+def test_persistence_roundtrip_keeps_channel(tmp_path):
+    path = str(tmp_path / "sem.json")
+    s = SemanticStore(channel="youtube_spizee")
+    s.add("the streamer's channel is Spizee 2", now=1.0)
+    s.save_file(path)
+
+    loaded = SemanticStore()
+    loaded.load_file(path)
+    assert [f.channel for f in loaded.retrieve("", k=1)] == ["youtube_spizee"]
+
+
 def test_persistence_roundtrip(tmp_path):
     path = str(tmp_path / "sem.json")
     s = SemanticStore()

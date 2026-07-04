@@ -1,4 +1,5 @@
 import asyncio
+import logging
 
 import pytest
 
@@ -124,7 +125,9 @@ async def test_video_frames_yields_raw_rgb_frames(monkeypatch):
         return proc
 
     monkeypatch.setattr(adapter, "_resolve_video_url", fake_resolve_video_url)
-    monkeypatch.setattr(youtube.asyncio, "create_subprocess_exec", fake_create_subprocess_exec)
+    monkeypatch.setattr(
+        "asyncio.create_subprocess_exec", fake_create_subprocess_exec
+    )
 
     frames = []
     async for frame in adapter.video_frames():
@@ -135,6 +138,35 @@ async def test_video_frames_yields_raw_rgb_frames(monkeypatch):
     assert calls
     assert "-pix_fmt" in calls[0]
     assert "rgb24" in calls[0]
+
+
+class OneChunkStderr:
+    def __init__(self, chunk: bytes) -> None:
+        self._chunks = [chunk, b""]
+
+    async def read(self, n: int) -> bytes:
+        return self._chunks.pop(0)
+
+
+@pytest.mark.asyncio
+async def test_ffmpeg_stderr_warns_while_running(caplog):
+    adapter = youtube.YouTubeCaptureAdapter("video-id")
+    with caplog.at_level(logging.DEBUG, logger="lingus.adapters._ffmpeg"):
+        await adapter._drain_ffmpeg_stderr(OneChunkStderr(b"HLS reconnecting"))
+    record = next(r for r in caplog.records if "HLS reconnecting" in r.message)
+    assert record.levelno == logging.WARNING
+
+
+@pytest.mark.asyncio
+async def test_ffmpeg_stderr_downgraded_during_teardown(caplog):
+    # ctrl-c: terminate() makes ffmpeg dump benign exit lines. Those must not
+    # surface as warnings once stop() has flipped the teardown flag.
+    adapter = youtube.YouTubeCaptureAdapter("video-id")
+    adapter._stopping = True
+    with caplog.at_level(logging.DEBUG, logger="lingus.adapters._ffmpeg"):
+        await adapter._drain_ffmpeg_stderr(OneChunkStderr(b"Immediate exit requested"))
+    record = next(r for r in caplog.records if "Immediate exit requested" in r.message)
+    assert record.levelno == logging.DEBUG
 
 
 @pytest.mark.asyncio

@@ -62,4 +62,7 @@ class PersonaSpec(BaseModel):
     relationships: list[Relationship] = Field(default_factory=list)
     boundaries: list[str] = Field(default_factory=list)  # what it won't engage with
     exemplar_bank: list[Exemplar] = Field(default_factory=list)
+    # How a plug should sound when a promotion cue is present: offhand, in-voice,
+    # never an ad read. Only used when config.promotions is enabled.
+    promo_exemplar_bank: list[Exemplar] = Field(default_factory=list)
     mood: Mood = Field(default_factory=Mood)

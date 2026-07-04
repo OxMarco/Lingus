@@ -4,7 +4,7 @@ import time
 import pytest
 
 from lingus.adapters.base import AudioChunk, ChatAdapter, ChatMessage, Frame, StreamCaptureAdapter
-from lingus.app import BotLoop, _build_fact_extractor, _build_vlm
+from lingus.app import BotLoop, CaptureError, _build_fact_extractor, _build_vlm
 from lingus.arbiter import ArbiterDecision
 from lingus.config import Settings
 from lingus.context import build_context_snapshot
@@ -168,7 +168,7 @@ async def test_bot_loop_replies_from_replayed_context():
             "arbiter": {"weights": {"streamer_mishap": 1.1}},
         }
     )
-    persona = PersonaSpec(name="Gremlin", voice="brief")
+    persona = PersonaSpec(name="Lingus", voice="brief")
     chat = CollectingChatAdapter()
     loop = BotLoop(
         settings=settings,
@@ -326,7 +326,10 @@ async def test_video_vlm_ingest_gates_frames_into_scene_events():
         frame_gate=FrameGate(diff_threshold=0.5, min_interval_seconds=0.0),
     )
 
-    await loop._ingest_video_vlm()
+    # The bounded fake feed "ends" mid-run, which on a live platform is an
+    # unrecoverable capture loss — the ingest raises after populating state.
+    with pytest.raises(CaptureError):
+        await loop._ingest_video_vlm()
 
     assert [frame.ts for frame in vlm.frames] == [0.0, 2.0]
     assert loop.world.scene.activity == "frame 2"
@@ -349,7 +352,8 @@ async def test_video_vlm_refreshes_scene_without_duplicate_event_text():
         frame_gate=FrameGate(diff_threshold=0.5, min_interval_seconds=0.0),
     )
 
-    await loop._ingest_video_vlm()
+    with pytest.raises(CaptureError):
+        await loop._ingest_video_vlm()
 
     assert loop.world.scene.activity == "state refresh 2"
     assert [e.payload["last_event"] for e in loop.world.events] == ["same visible event"]
@@ -370,10 +374,59 @@ async def test_audio_gate_blocks_chunks_before_asr_context():
         audio_gate=DropAllAudioGate(),
     )
 
-    await loop._ingest_audio_asr()
+    with pytest.raises(CaptureError):
+        await loop._ingest_audio_asr()
 
     assert asr.chunks == []
     assert list(loop.world.events) == []
+
+
+def _audio_loss_loop(platform: str) -> BotLoop:
+    return BotLoop(
+        settings=Settings.model_validate({"platform": platform}),
+        persona=PersonaSpec(name="test", voice="brief"),
+        capture=AudioCaptureAdapter(
+            [AudioChunk(pcm=b"\1" * 3200, sample_rate=16_000, ts=0.0)]
+        ),
+        chat=CollectingChatAdapter(),
+        segment=None,
+        asr=RecordingASR(),
+    )
+
+
+@pytest.mark.asyncio
+async def test_live_audio_capture_loss_crashes_the_run():
+    loop = _audio_loss_loop("youtube")
+    # Live audio has no clean end: the feed dropping mid-run must crash.
+    with pytest.raises(CaptureError):
+        await loop._ingest_audio_asr()
+
+
+@pytest.mark.asyncio
+async def test_capture_loss_suppressed_during_requested_shutdown():
+    loop = _audio_loss_loop("youtube")
+    loop._stop.set()  # we asked to stop; exhaustion is expected, not a failure
+    await loop._ingest_audio_asr()  # must not raise
+
+
+@pytest.mark.asyncio
+async def test_capture_exhaustion_not_a_loss_on_offline_replay():
+    loop = _audio_loss_loop("file_replay")
+    await loop._ingest_audio_asr()  # replay exhaustion is a clean end, no crash
+
+
+@pytest.mark.asyncio
+async def test_live_chat_failure_crashes_the_run():
+    loop = BotLoop(
+        settings=Settings.model_validate({"platform": "youtube"}),
+        persona=PersonaSpec(name="test", voice="brief"),
+        capture=EmptyCaptureAdapter(),
+        chat=BrokenChatAdapter(),
+        segment=None,
+    )
+    # Chat is a capture channel too: an unrecoverable failure must crash the run.
+    with pytest.raises(RuntimeError, match="chat stream failed"):
+        await asyncio.wait_for(loop.run(), timeout=1.0)
 
 
 @pytest.mark.asyncio
@@ -419,14 +472,14 @@ def test_build_vlm_disabled_by_default():
     assert _build_vlm(Settings.model_validate({})) is None
 
 
-def test_build_vlm_uses_local_analyzer_for_live_video():
-    from lingus.models.local_vision import LocalFrameAnalyzer, MLXVLMSceneAnalyzer
+def test_build_vlm_uses_mlx_without_fallback_for_live_video():
+    from lingus.models.local_vision import MLXVLMSceneAnalyzer
 
     settings = Settings.model_validate({"platform": "youtube"})
     vlm = _build_vlm(settings)
 
+    # No local_cv fallback exists: a broken VLM must terminate the run.
     assert isinstance(vlm, MLXVLMSceneAnalyzer)
-    assert isinstance(vlm.fallback, LocalFrameAnalyzer)
     assert vlm.model_name == "mlx-community/Qwen2.5-VL-3B-Instruct-4bit"
 
 
@@ -448,9 +501,7 @@ def test_fact_extractor_stays_local_even_when_llm_backend_exists():
 
 
 @pytest.mark.asyncio
-async def test_post_message_drops_unsafe_output():
-    from lingus.safety import RegexModeration
-
+async def test_post_message_admits_normal_output():
     settings = Settings.model_validate({"platform": "file_replay"})
     persona = PersonaSpec(name="test", voice="brief")
     chat = CollectingChatAdapter()
@@ -460,30 +511,6 @@ async def test_post_message_drops_unsafe_output():
         capture=EmptyCaptureAdapter(),
         chat=chat,
         segment=None,
-        safety=RegexModeration(),
-    )
-
-    posted, dropped = await loop._post_message("kys loser", drop_context="reply")
-    assert posted is None
-    assert dropped is not None and "unsafe" in dropped
-    assert chat.posts == []
-    assert list(loop.world.own_messages) == []
-
-
-@pytest.mark.asyncio
-async def test_post_message_admits_safe_output():
-    from lingus.safety import RegexModeration
-
-    settings = Settings.model_validate({"platform": "file_replay"})
-    persona = PersonaSpec(name="test", voice="brief")
-    chat = CollectingChatAdapter()
-    loop = BotLoop(
-        settings=settings,
-        persona=persona,
-        capture=EmptyCaptureAdapter(),
-        chat=chat,
-        segment=None,
-        safety=RegexModeration(),
     )
 
     posted, dropped = await loop._post_message(

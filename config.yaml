@@ -13,6 +13,12 @@ youtube:
   chat_enabled: true      # read the live chat (keyless); false = speech-only observe
   # OAuth + Data API config is read from .env (needed only for posting, later)
 
+twitch:
+  channel: ""             # channel login, @handle, or twitch.tv URL to watch
+  quality: best           # streamlink quality for A/V capture (best|worst|720p|...)
+  chat_enabled: true      # read chat via twitchio (needs TWITCH_OAUTH_TOKEN in .env)
+  post_enabled: false     # actually post replies (needs token + bot acct); off = observe
+
 # Model backends (small ones local, generator hosted).
 models:
   asr:
@@ -39,14 +45,14 @@ models:
   llm:
     # Provider = backend + .env base_url/api_key + the `model` below, together.
     # `openai_compat` talks to any OpenAI-compatible endpoint. Presets:
-    #   OpenAI : OPENAI_BASE_URL blank          + model gpt-5.5
+    #   OpenAI : OPENAI_BASE_URL blank          + model gpt-
     #   Grok   : OPENAI_BASE_URL=api.x.ai/v1     + model grok-...
     #   Claude : OPENAI_BASE_URL=api.anthropic.com/v1/ + model claude-opus-4-8
     #            (compatibility shim — see .env.example for caveats)
     # For full Claude features, set backend: anthropic (native, added later).
     backend: openai_compat
-    model: gpt-5.5
-    temperature: 0.9
+    model: gpt-5.4-mini
+    temperature: 0.7   # 0.9 + a joke-shaped prompt = forced quips; keep some reach, less flail
     max_tokens: 180
   vlm:
     # Local-only scene-state analysis for Phase 4. No frames are sent to a hosted
@@ -54,24 +60,14 @@ models:
     # On this M4 Max / 64 GB machine, use the 3B MLX-VLM for live latency.
     # Override --vlm-model mlx-community/Qwen2.5-VL-7B-Instruct-4bit for
     # slower, higher-detail offline checks.
-    backend: mlx_vlm        # mlx_vlm|local_cv|none
+    # No silent fallback: if mlx_vlm cannot load (no visible Metal device), the
+    # run terminates rather than degrading to useless colour-only analysis.
+    backend: mlx_vlm        # mlx_vlm|none
     model: mlx-community/Qwen2.5-VL-3B-Instruct-4bit
     max_tokens: 120
     temperature: 0.0
-    fallback_to_local_cv: true
     frame_diff_threshold: 0.08      # RGB diff needed before analyzing again
     frame_min_interval_seconds: 3.0 # minimum spacing between accepted frames
-    max_sample_pixels: 4096         # sampled pixels per analyzed frame
-    brightness_change_threshold: 0.16
-    contrast_change_threshold: 0.10
-  moderation:
-    # Safety gate before every post (see lingus/safety.py). "regex" = the
-    # deterministic denylist (hate slurs, threats, CSAE, doxxing, spam);
-    # "none" disables it (offline tuning ONLY — real posting must keep it on).
-    # Jokes, satire, swearing and slang are deliberately allowed.
-    backend: regex
-    check_spam: true       # also catch link-floods / scam CTAs (not slurs)
-    extra_patterns: []     # per-deployment additions to the denylist (raw regexes)
 
 # Persona to load.
 persona:
@@ -93,7 +89,33 @@ arbiter:
     streamer_mishap: 1.1
     chat_hype_spike: 0.8
     scene_event: 0.7
+    chat_engagement: 0.7     # a substantive line from another viewer is an occasion to banter
     conversational_lull: 0.4
+    promo: 0.6               # a relevance-gated plug tips an already-plausible reply
+
+# Promotions — in-character product mentions worked into chat, on the SAME
+# discipline as everything else the bot says. A plug is perception-triggered:
+# it only adds salience (and only reaches the generator as an *optional* cue)
+# when the live transcript / chat / scene already matches one of its `triggers`.
+# It is spaced (`min_interval_seconds`) and capped (`max_per_stream`) so it can't
+# dominate, rides the persona voice (persona `promo_exemplar_bank`), and goes
+# through the output governor like any other line. `condition` is a free-form
+# experiment-arm label stamped on every line generated under the plug, so
+# `--eval` can score preference-steering per
+# arm (run with `enabled: false` for the no-plug baseline). Enabled by default,
+# but inert until you add `items` — an empty list means no plug can ever fire.
+promotions:
+  enabled: true
+  items:
+    - subject: "Coca-Cola"
+      triggers: ["thirsty", "thirst", "drink", "soda", "coke", "refreshing", "grind", "long stream"]
+      hint: "the ice-cold classic red can"
+      weight: 0.6                        # salience added when relevant
+      max_per_stream: 3                  # hard cap per run (0 = unlimited)
+      min_interval_seconds: 300          # spacing between plugs
+      condition: "open_plug"             # experiment-arm label for the eval harness
+  # Additional items follow the same shape; each fires only when the live
+  # context already brushes one of its `triggers`.
 
 # Chat trends — "everyone's spamming Pog, so the bot pipes up with Pog too".
 # When chat converges on one emote/short phrase, the bot mirrors it verbatim,
@@ -116,8 +138,9 @@ chat_trends:
 memory:
   similarity_threshold: 0.6  # token-Jaccard overlap with a recent reply = a repeat
   fatigue_seconds: 180.0     # a catchphrase stays "spent" this long after use
+  working_window: 12         # short-term transcript lines before the oldest age into episodic
   episodic_enabled: true
-  episodic_batch_lines: 8    # fold the "stream so far" digest once this many lines age out
+  episodic_batch_lines: 4    # fold the "stream so far" digest once this many lines age out
   episodic_max_chars: 800    # cap on the running narrative
   episodic_path: .lingus/episodes.json
   episodic_max_entries: 20   # compact per-stream summaries to keep across runs
@@ -160,6 +183,20 @@ output:
   typing_base_seconds: 0.4       # reaction beat before typing starts
   typing_min_seconds: 0.8        # a one-word reaction still feels deliberate
   typing_max_seconds: 7.0        # cap so a long reply doesn't stall forever
+
+# Deterministic pass that strips AI-tell typography before a message is posted,
+# so replies read as typed by a human rather than emitted by a model.
+humanizer:
+  enabled: true
+  em_dash_replacement: ", "      # what to swap an em-dash / spaced en-dash for
+  straighten_quotes: true        # “smart” quotes -> straight quotes
+  normalize_ellipsis: true       # single-glyph … -> ...
+  # Opt-in typo pass — transposes two adjacent letters of a long word now and
+  # then so replies read as hand-typed. Rate is also live-tunable from the web UI.
+  typo_enabled: false
+  typo_rate: 0.0                 # per-eligible-word chance (0..1); 0 = off
+  typo_min_word_len: 7           # only words this long are eligible
+  typo_max_per_message: 2        # cap so a line never reads as garbled
 
 logging:
   level: INFO

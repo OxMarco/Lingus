@@ -20,6 +20,7 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Protocol
 
+from ._io import atomic_write_text
 from .repetition import _tokens, jaccard  # noqa: PLC2701 (sibling helper reuse)
 
 if TYPE_CHECKING:
@@ -38,6 +39,7 @@ class EpisodicMemory:
     stream_id: str
     kind: str = "stream_summary"
     source: str = "stream"
+    channel: str = ""  # which channel this stream belongs to ("" = unscoped legacy)
     created_ts: float = 0.0
     updated_ts: float = 0.0
     last_seen_ts: float = 0.0
@@ -45,19 +47,33 @@ class EpisodicMemory:
 
 
 class EpisodicArchive:
-    """Durable per-stream summaries.
+    """Durable per-stream summaries, optionally scoped to one channel.
 
     Short-term memory stays in `WorldState`; this archive stores compact stream
     summaries across runs so the bot can make callbacks without carrying raw
     transcripts or introducing a vector DB.
-    """
 
-    def __init__(self, *, max_entries: int = 20) -> None:
+    `channel` is the identity of the stream this run is watching (a
+    `ChannelIdentity.cache_key()`, shared with `SemanticStore`). A scoped archive
+    only *surfaces* summaries from its own channel — the "stream so far" of a
+    church service must not resurface as a past memory while watching a food
+    streamer — but it still round-trips every channel's summaries through the
+    shared JSON file, so other channels' narratives survive. An unscoped archive
+    (`channel=""`) sees everything (replay/eval, platforms with no resolvable
+    identity)."""
+
+    def __init__(self, *, max_entries: int = 20, channel: str = "") -> None:
         self.max_entries = max_entries
+        self.channel = channel
         self._episodes: list[EpisodicMemory] = []
 
     def __len__(self) -> int:
-        return len(self._episodes)
+        return len(self._visible())
+
+    def _visible(self) -> list[EpisodicMemory]:
+        if not self.channel:
+            return list(self._episodes)
+        return [e for e in self._episodes if e.channel == self.channel]
 
     def add(
         self,
@@ -72,7 +88,9 @@ class EpisodicArchive:
         if not summary:
             return None
         current = time.time() if now is None else now
-        for episode in self._episodes:
+        # Upsert only within this channel's episodes: the same stream id under a
+        # different channel is a different stream, not the one to overwrite.
+        for episode in self._visible():
             if episode.stream_id == stream_id:
                 episode.summary = summary
                 episode.source = source
@@ -84,6 +102,7 @@ class EpisodicArchive:
             summary=summary,
             stream_id=stream_id,
             source=source,
+            channel=self.channel,
             created_ts=current,
             updated_ts=current,
             last_seen_ts=current,
@@ -100,11 +119,12 @@ class EpisodicArchive:
         now: float | None = None,
     ) -> list[EpisodicMemory]:
         """Top-k summaries by token overlap, then prior usefulness and recency."""
-        if not self._episodes or k <= 0:
+        visible = self._visible()
+        if not visible or k <= 0:
             return []
         qt = _tokens(query)
         ranked = sorted(
-            self._episodes,
+            visible,
             key=lambda e: (jaccard(qt, _tokens(e.summary)), e.hits, e.updated_ts),
             reverse=True,
         )
@@ -116,13 +136,31 @@ class EpisodicArchive:
         return top
 
     def summaries(self) -> list[str]:
-        return [episode.summary for episode in self._episodes]
+        return [episode.summary for episode in self._visible()]
+
+    def summary_for(self, stream_id: str) -> str:
+        """The stored narrative for one stream, or "" if none.
+
+        Used on restart to rehydrate the *working* summary of a resumed stream:
+        without it the run starts with an empty narrative and the next
+        consolidation overwrites this stream's archived summary with a
+        session-2-only one, truncating everything before the restart."""
+        stream_id = stream_id.strip()
+        for episode in self._visible():
+            if episode.stream_id == stream_id:
+                return episode.summary
+        return ""
 
     def _evict(self) -> None:
-        if len(self._episodes) <= self.max_entries:
+        # The cap is per channel: this run may only trim its own summaries, never
+        # another channel's narrative that merely shares the file.
+        visible = self._visible()
+        if len(visible) <= self.max_entries:
             return
-        self._episodes.sort(key=lambda e: (e.hits, e.updated_ts))
-        self._episodes = self._episodes[len(self._episodes) - self.max_entries :]
+        # Drop the least useful first: fewest retrievals, then least recently seen.
+        visible.sort(key=lambda e: (e.hits, e.updated_ts))
+        drop = {id(e) for e in visible[: len(visible) - self.max_entries]}
+        self._episodes = [e for e in self._episodes if id(e) not in drop]
 
     def load_file(self, path: str) -> None:
         p = Path(path)
@@ -151,14 +189,15 @@ class EpisodicArchive:
             episode.stream_id = episode.stream_id.strip()
             if episode.summary and episode.stream_id:
                 episodes.append(episode)
-        self._episodes = episodes[: self.max_entries]
+        # Keep every channel's summaries in memory (they round-trip through the
+        # shared file); only trim this run's own channel back to the cap.
+        self._episodes = episodes
+        self._evict()
 
     def save_file(self, path: str) -> None:
-        p = Path(path)
-        p.parent.mkdir(parents=True, exist_ok=True)
-        p.write_text(
+        atomic_write_text(
+            Path(path),
             json.dumps({"episodes": [asdict(e) for e in self._episodes]}, indent=2),
-            encoding="utf-8",
         )
 
 

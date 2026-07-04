@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import abc
 from collections.abc import AsyncIterator
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Literal
 
 from ..adapters.base import AudioChunk, Frame
@@ -41,13 +41,6 @@ class ChatTurn:
     content: str
 
 
-@dataclass(slots=True)
-class ModerationResult:
-    allowed: bool
-    reason: str = ""
-    categories: list[str] = field(default_factory=list)
-
-
 class ASRBackend(abc.ABC):
     @abc.abstractmethod
     def transcribe_stream(
@@ -76,9 +69,3 @@ class LLMBackend(abc.ABC):
     @abc.abstractmethod
     async def generate(self, messages: list[ChatTurn], **opts) -> str:
         """Generate a single completion from a chat-style message list."""
-
-
-class ModerationBackend(abc.ABC):
-    @abc.abstractmethod
-    async def check(self, text: str) -> ModerationResult:
-        """Decide whether a generated message is safe to post."""

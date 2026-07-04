@@ -22,6 +22,7 @@ ctranslate2 and onnxruntime release the GIL).
 from __future__ import annotations
 
 import asyncio
+import time
 from collections.abc import AsyncIterator
 
 import numpy as np
@@ -178,11 +179,25 @@ class FasterWhisperASR(ASRBackend):
         # int16 PCM -> float32 in [-1, 1], which is what faster-whisper expects.
         # No vad_filter here: the segmenter already isolated the speech.
         audio = np.frombuffer(pcm, dtype=np.int16).astype(np.float32) / 32768.0
+        started = time.perf_counter()
         segments, _info = self._model.transcribe(
             audio,
             language=self._language,
             condition_on_previous_text=False,
             no_speech_threshold=0.6,
+        )
+        # faster-whisper is lazy: iterate to force the actual decode before timing.
+        segments = list(segments)
+        elapsed = time.perf_counter() - started
+        audio_seconds = len(audio) / self._sr
+        # RTF < 1 means we transcribe faster than real time (can keep up with a
+        # live stream); RTF > 1 means we fall behind. The load-bearing number.
+        rtf = elapsed / audio_seconds if audio_seconds else 0.0
+        log.debug(
+            "asr transcribe: %.0fms for %.1fs audio (RTF %.2f)",
+            elapsed * 1000,
+            audio_seconds,
+            rtf,
         )
         # Drop hallucinated segments (the "Sottotitoli a cura di…" family Whisper
         # emits on music/near-silence). Keeps the bot from reacting to phantom

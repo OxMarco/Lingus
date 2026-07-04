@@ -1,20 +1,18 @@
-"""Local video analysis for Phase 4.
+"""Local video scene analysis for Phase 4.
 
-This is intentionally conservative: it never sends frames to a hosted model and
-does not pretend to identify objects or read text. It extracts cheap visual
-signals that are still useful for timing: major brightness, contrast, and color
-changes in the live feed.
+Scene understanding runs entirely on-device via a local MLX-VLM: frames are
+never sent to a hosted model. There is deliberately no colour-only fallback —
+if the VLM cannot load, the run terminates rather than degrading to useless
+brightness/contrast stats that cannot describe what is on screen.
 """
 
 from __future__ import annotations
 
-import asyncio
 import contextlib
 import json
 import os
 import tempfile
-from dataclasses import dataclass
-from math import sqrt
+import time
 from typing import Any
 
 from pydantic import BaseModel, Field, ValidationError
@@ -27,17 +25,6 @@ from .base import VLMBackend
 log = get_logger(__name__)
 
 
-@dataclass(frozen=True, slots=True)
-class FrameStats:
-    brightness: float
-    contrast: float
-    red: float
-    green: float
-    blue: float
-    dominant_color: str
-    tone: str
-
-
 class _SceneResponse(BaseModel):
     changed: bool = True
     activity: str = ""
@@ -45,68 +32,6 @@ class _SceneResponse(BaseModel):
     on_screen_text: str = ""
     salient_objects: list[str] = Field(default_factory=list)
     last_event: str = ""
-
-
-class LocalFrameAnalyzer(VLMBackend):
-    """Dependency-light local frame analyzer.
-
-    The output is scene-state, but deliberately generic: "dark high-contrast
-    blue-toned frame" is safe and useful; "streamer picked up a trophy" would
-    require a real local vision model, so this backend does not invent it.
-    """
-
-    def __init__(
-        self,
-        *,
-        max_sample_pixels: int = 4096,
-        brightness_change_threshold: float = 0.16,
-        contrast_change_threshold: float = 0.10,
-    ) -> None:
-        if max_sample_pixels <= 0:
-            raise ValueError("max_sample_pixels must be positive")
-        self.max_sample_pixels = max_sample_pixels
-        self.brightness_change_threshold = brightness_change_threshold
-        self.contrast_change_threshold = contrast_change_threshold
-        self._last_stats: FrameStats | None = None
-
-    async def describe_change(self, frame: Frame, prev: SceneState) -> SceneState:
-        stats = analyze_frame(frame, max_sample_pixels=self.max_sample_pixels)
-        last_event = self._describe_delta(stats)
-        self._last_stats = stats
-        if not last_event and prev.activity:
-            return prev
-        return SceneState(
-            activity=_activity(stats),
-            setting=prev.setting or "unknown",
-            on_screen_text="",
-            salient_objects=_visual_descriptors(stats),
-            last_event=last_event or "video frame analyzed locally",
-        )
-
-    def _describe_delta(self, stats: FrameStats) -> str:
-        prev = self._last_stats
-        if prev is None:
-            return "video feed became available for local analysis"
-        reasons: list[str] = []
-        brightness_delta = stats.brightness - prev.brightness
-        if abs(brightness_delta) >= self.brightness_change_threshold:
-            reasons.append(
-                "scene became brighter" if brightness_delta > 0 else "scene became darker"
-            )
-        contrast_delta = stats.contrast - prev.contrast
-        if abs(contrast_delta) >= self.contrast_change_threshold:
-            reasons.append(
-                "scene contrast increased" if contrast_delta > 0 else "scene contrast decreased"
-            )
-        if (
-            stats.dominant_color != prev.dominant_color
-            and stats.dominant_color != "neutral"
-            and prev.dominant_color != "neutral"
-        ):
-            reasons.append(
-                f"dominant color shifted from {prev.dominant_color} to {stats.dominant_color}"
-            )
-        return "; ".join(reasons) if reasons else "visual composition changed"
 
 
 class MLXVLMSceneAnalyzer(VLMBackend):
@@ -123,31 +48,27 @@ class MLXVLMSceneAnalyzer(VLMBackend):
         model: str,
         max_tokens: int = 180,
         temperature: float = 0.0,
-        fallback: VLMBackend | None = None,
     ) -> None:
         self.model_name = model
         self.max_tokens = max_tokens
         self.temperature = temperature
-        self.fallback = fallback
         self._loaded: tuple[Any, Any, Any, Any, Any] | None = None
-        self._warned_fallback = False
 
     async def describe_change(self, frame: Frame, prev: SceneState) -> SceneState:
         try:
-            return await asyncio.to_thread(self._describe_change_sync, frame, prev)
+            # Keep MLX on the owning asyncio/main thread. libmlx keeps compiler
+            # state in thread-local storage and has crashed on macOS when Python
+            # worker threads exit during Ctrl+C shutdown.
+            return self._describe_change_sync(frame, prev)
         except Exception as exc:
-            if self.fallback is None:
-                raise RuntimeError(
-                    "mlx_vlm backend needs the 'video-mlx' extra: "
-                    "pip install -e '.[video-mlx]' and a visible Metal device"
-                ) from exc
-            if not self._warned_fallback:
-                log.warning(
-                    "mlx_vlm unavailable (%s); falling back to local_cv scene analysis",
-                    exc,
-                )
-                self._warned_fallback = True
-            return await self.fallback.describe_change(frame, prev)
+            # No colour-only fallback: colour stats are useless for scene
+            # understanding, and silently degrading hides a broken VLM. Raise so
+            # the task supervisor stops the run.
+            raise RuntimeError(
+                "mlx_vlm scene analysis failed; local video needs the "
+                "'video-mlx' extra (pip install -e '.[video-mlx]') and a visible "
+                "Metal device. Set models.vlm.backend=none to disable video."
+            ) from exc
 
     def _describe_change_sync(self, frame: Frame, prev: SceneState) -> SceneState:
         load, generate, apply_chat_template, load_config, model_bundle = self._load()
@@ -156,6 +77,7 @@ class MLXVLMSceneAnalyzer(VLMBackend):
         try:
             prompt = _scene_prompt(prev)
             formatted = apply_chat_template(processor, config, prompt, num_images=1)
+            started = time.perf_counter()
             try:
                 output = generate(
                     model,
@@ -168,6 +90,11 @@ class MLXVLMSceneAnalyzer(VLMBackend):
                 )
             except TypeError:
                 output = generate(model, processor, formatted, [image_path])
+            log.debug(
+                "vlm scene analysis: %.0fms (max_tokens=%d)",
+                (time.perf_counter() - started) * 1000,
+                self.max_tokens,
+            )
         finally:
             with contextlib.suppress(OSError):
                 os.unlink(image_path)
@@ -195,99 +122,6 @@ class MLXVLMSceneAnalyzer(VLMBackend):
         return self._loaded
 
 
-def analyze_frame(frame: Frame, *, max_sample_pixels: int = 4096) -> FrameStats:
-    expected = frame.width * frame.height * 3
-    if frame.width <= 0 or frame.height <= 0:
-        raise ValueError("frame dimensions must be positive")
-    if len(frame.data) != expected:
-        raise ValueError("frame data length does not match width*height*3")
-
-    pixels = frame.width * frame.height
-    step = max(1, pixels // max_sample_pixels)
-    count = 0
-    total_r = total_g = total_b = 0.0
-    total_luma = 0.0
-    total_luma_sq = 0.0
-    for pixel in range(0, pixels, step):
-        i = pixel * 3
-        r = frame.data[i] / 255.0
-        g = frame.data[i + 1] / 255.0
-        b = frame.data[i + 2] / 255.0
-        luma = 0.2126 * r + 0.7152 * g + 0.0722 * b
-        total_r += r
-        total_g += g
-        total_b += b
-        total_luma += luma
-        total_luma_sq += luma * luma
-        count += 1
-    red = total_r / count
-    green = total_g / count
-    blue = total_b / count
-    brightness = total_luma / count
-    variance = max(0.0, (total_luma_sq / count) - (brightness * brightness))
-    contrast = sqrt(variance)
-    return FrameStats(
-        brightness=brightness,
-        contrast=contrast,
-        red=red,
-        green=green,
-        blue=blue,
-        dominant_color=_dominant_color(red, green, blue),
-        tone=_tone(brightness),
-    )
-
-
-def _activity(stats: FrameStats) -> str:
-    contrast = "high-contrast" if stats.contrast >= 0.22 else "low-contrast"
-    if stats.dominant_color == "neutral":
-        return f"local video analysis: {stats.tone} {contrast} frame"
-    return (
-        f"local video analysis: {stats.tone} {contrast} "
-        f"{stats.dominant_color}-toned frame"
-    )
-
-
-def _visual_descriptors(stats: FrameStats) -> list[str]:
-    descriptors = [f"{stats.tone} frame"]
-    if stats.contrast >= 0.22:
-        descriptors.append("high contrast")
-    if stats.dominant_color != "neutral":
-        descriptors.append(f"{stats.dominant_color}-toned image")
-    return descriptors
-
-
-def _tone(brightness: float) -> str:
-    if brightness < 0.18:
-        return "dark"
-    if brightness > 0.78:
-        return "bright"
-    return "mid-brightness"
-
-
-def _dominant_color(red: float, green: float, blue: float) -> str:
-    hi = max(red, green, blue)
-    lo = min(red, green, blue)
-    if hi - lo < 0.08:
-        return "neutral"
-    if red >= green and red >= blue:
-        if green > blue * 1.25:
-            return "yellow"
-        if blue > green * 1.25:
-            return "magenta"
-        return "red"
-    if green >= red and green >= blue:
-        if blue > red * 1.25:
-            return "cyan"
-        if red > blue * 1.25:
-            return "yellow"
-        return "green"
-    if red > green * 1.25:
-        return "magenta"
-    if green > red * 1.25:
-        return "cyan"
-    return "blue"
-
-
 def _scene_prompt(prev: SceneState) -> str:
     prev_state = {
         "activity": prev.activity,
@@ -298,14 +132,21 @@ def _scene_prompt(prev: SceneState) -> str:
     }
     return (
         "You are the local video perception module for a live-stream chat bot. "
-        "Describe only visible facts from this frame; do not infer identity, "
-        "private attributes, emotion, or intent. Prefer generic visible labels "
-        "like vehicle, animal, road, menu, or text over uncertain specific nouns. "
-        "If the frame is unclear or effectively unchanged, set changed=false. "
-        "Compare with the previous scene state and return compact JSON only with "
-        "keys: changed, activity, setting, on_screen_text, salient_objects, "
-        "last_event. Keep activity and last_event under 12 words each, and use "
-        "previous values for fields that are still true.\nPrevious scene state:\n"
+        "Describe what is visibly happening in this frame in concrete, specific "
+        "terms. Name the actual objects you see (a mug, a mechanical keyboard, a "
+        "race car) rather than vague categories, and describe the subject's "
+        "visible action and expression (e.g. sipping coffee, laughing, leaning "
+        "into the mic). You may report a visible facial expression, but do not "
+        "guess at hidden intent, private attributes, or a person's identity. "
+        "For on_screen_text, transcribe only text that is actually legible in the "
+        "frame; never invent captions, names, overlays, or notifications that are "
+        "not clearly readable. If the frame is unclear or effectively unchanged "
+        "from the previous state, set changed=false. Compare with the previous "
+        "scene state and return compact JSON only with keys: changed, activity, "
+        "setting, on_screen_text, salient_objects, last_event. Keep activity and "
+        "last_event vivid but under 16 words each; set last_event to the single "
+        "most notable thing that just changed. Reuse previous values for fields "
+        "that are still true.\nPrevious scene state:\n"
         + json.dumps(prev_state, ensure_ascii=True)
     )
 

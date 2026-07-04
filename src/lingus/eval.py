@@ -5,10 +5,11 @@ component that lets you. It replays a recorded segment through the real loop,
 captures every line the bot posts (with the context that triggered it), and
 scores those lines on three axes that map directly onto the failure modes in §9:
 
-- **in_character** — no assistant-voice leak, uses the persona's voice, avoids
-  its banned words (the #1 immersion-killer).
+- **in_character** — no assistant-voice leak, uses the persona's voice without
+  performing it (slang bolted onto line ends is a tryhard tell), avoids its
+  banned words (the #1 immersion-killer).
 - **not_generic** — grounded in what's actually happening, not interchangeable
-  filler ("nice", "lol", "wow").
+  filler ("nice", "lol", "wow") and not a caption of the scene state.
 - **not_repetitive** — doesn't echo the bot's other outputs this run.
 
 Two judges sit behind one `Judge` protocol: a deterministic `HeuristicJudge`
@@ -56,6 +57,11 @@ _ASSISTANT_TELLS = (
     "feel free to",
     "i'm here to",
 )
+
+# Fake-casual tells: slang bolted onto the end of a line reads as a bot
+# performing casualness ("...becomes a boss fight ngl"), not a person being
+# casual. Checked together with the persona's own lexicon.use words.
+_TRAILING_SLANG = frozenset({"ngl", "lowkey", "tbh", "fr", "frfr", "imo", "istg"})
 
 # Interchangeable filler — a message made only of these says nothing.
 _GENERIC_FILLER = frozenset(
@@ -113,6 +119,7 @@ class EvalSample:
     transcript_tail: str = ""
     recent_chat: list[str] = field(default_factory=list)
     scene_summary: str = ""
+    condition: str = ""  # experiment arm this line was generated under ("" = baseline)
 
     def context_text(self) -> str:
         return " ".join([self.scene_summary, self.transcript_tail, *self.recent_chat]).strip()
@@ -163,6 +170,28 @@ class EvalReport:
     def mean_overall(self) -> float:
         return self._mean(lambda s: s.overall)
 
+    def by_condition(self) -> dict[str, dict[str, float]]:
+        """Per experiment-arm breakdown: count + mean scores, keyed by condition.
+
+        The empty-string arm is the no-plug baseline. Comparing a plug arm's
+        lines against baseline is the preference-steering readout the harness
+        exists to produce.
+        """
+        arms: dict[str, list[ScoredSample]] = {}
+        for ss in self.scored:
+            arms.setdefault(ss.sample.condition, []).append(ss)
+        out: dict[str, dict[str, float]] = {}
+        for name, group in arms.items():
+            n = len(group)
+            out[name] = {
+                "n": n,
+                "in_character": sum(s.score.in_character for s in group) / n,
+                "not_generic": sum(s.score.not_generic for s in group) / n,
+                "not_repetitive": sum(s.score.not_repetitive for s in group) / n,
+                "overall": sum(s.score.overall for s in group) / n,
+            }
+        return out
+
     def summary_lines(self) -> list[str]:
         lines = [
             f"persona: {self.persona}   segment: {self.segment}",
@@ -195,6 +224,10 @@ class EvalReport:
             "n_posted": self.n_posted,
             "n_dropped": self.n_dropped,
             "mean_overall": round(self.mean_overall, 4),
+            "by_condition": {
+                name: {k: round(v, 4) for k, v in stats.items()}
+                for name, stats in self.by_condition().items()
+            },
             "samples": [
                 {
                     **asdict(ss.sample),
@@ -237,6 +270,7 @@ class CollectingMonitor:
                     transcript_tail=report.transcript_tail,
                     recent_chat=[f"{line.author}: {line.text}" for line in report.recent_chat],
                     scene_summary=report.scene_summary,
+                    condition=report.condition,
                 )
             )
 
@@ -281,8 +315,19 @@ class HeuristicJudge:
         if used_voice:
             ic = min(1.0, ic + 0.15)
             notes.append("uses persona lexicon")
+        words = _WORD_RE.findall(low)
+        slangish = _TRAILING_SLANG | {
+            w.lower() for w in persona.lexicon.use if " " not in w
+        }
+        if len(words) > 1 and words[-1] in slangish:
+            ic -= 0.25  # slang as a suffix is the tryhard tell, not the voice
+            notes.append(f"trailing slang: {words[-1]!r}")
         if low.rstrip().endswith("?"):
-            ic -= 0.15  # the persona rules discourage trailing questions
+            # Questions are now a sanctioned move — asking the streamer something
+            # or bantering back at a viewer is in-character, not an assistant tell
+            # (those are caught by _ASSISTANT_TELLS above). Keep only a light nudge
+            # so the bot doesn't turn *every* line into a question.
+            ic -= 0.05
             notes.append("trailing question")
         ic = _clamp(ic)
 
@@ -293,12 +338,21 @@ class HeuristicJudge:
         else:
             filler_frac = 1.0
         ng = 1.0 - 0.7 * filler_frac
-        grounded = bool(_content_tokens(text) & _content_tokens(sample.context_text()))
+        line_content = _content_tokens(text)
+        grounded = bool(line_content & _content_tokens(sample.context_text()))
         if grounded:
             ng = min(1.0, ng + 0.15)
             notes.append("grounded in context")
         elif filler_frac > 0.5:
             notes.append("mostly filler")
+        # Scene-echo: a line built mostly out of the scene state's own words is
+        # captioning what everyone can already see, not reacting to it.
+        scene_content = _content_tokens(sample.scene_summary)
+        if line_content and scene_content:
+            shared = line_content & scene_content
+            if len(shared) >= 2 and len(shared) / len(line_content) >= 0.5:
+                ng -= 0.4
+                notes.append("restates the scene")
         ng = _clamp(ng)
 
         # --- not_repetitive ---

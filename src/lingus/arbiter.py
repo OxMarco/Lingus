@@ -110,6 +110,7 @@ class SimpleArbiter:
         persona_name: str,
         seconds_since_own_message: float,
         mood: float = 0.0,
+        promo_salience: float = 0.0,
     ) -> ArbiterDecision:
         threshold = self.effective_threshold(seconds_since_own_message, mood)
         event = snapshot.latest_event
@@ -124,13 +125,25 @@ class SimpleArbiter:
         if event.age(snapshot.now) > self.max_trigger_age:
             reasons.append("stale_trigger")
 
-        if self._mentions_persona(text, persona_name):
+        addressed = self._mentions_persona(text, persona_name)
+        if addressed:
             score += self._weight("direct_address", 1.5)
             reasons.append("direct_address")
 
         if self._looks_like_question(text):
             score += self._weight("unanswered_question", 1.2)
             reasons.append("question")
+
+        # Talk *with* chat, not only about the stream: a substantive line from
+        # another viewer (that isn't already aimed at the bot) is an occasion to
+        # jump in and banter. Partial pressure by design — on its own 0.7 won't
+        # clear the bar, so the bot chimes into chat when the room is already
+        # lively (hype/mood) or quiet (lull), not on every message. Skipped when
+        # the bot is directly addressed (that's `direct_address`, not butting in)
+        # and when the line is short enough to be a pile-on the trend mirror owns.
+        if not addressed and self._worth_engaging(event, text):
+            score += self._weight("chat_engagement", 0.7)
+            reasons.append("chat_engagement")
 
         if self._has_hype(text) or snapshot.chat_state.hype_level >= 0.7:
             score += self._weight("chat_hype_spike", 0.8)
@@ -152,6 +165,21 @@ class SimpleArbiter:
         if lull > 0.0:
             score += self._weight("conversational_lull", 0.4) * lull
             reasons.append("lull")
+            # A lull over the streamer's own voice is the moment to be curious:
+            # tag it so the generator may *ask the streamer something* rather than
+            # only reacting. Purely a behavioral hint — it adds no score, so it
+            # never makes the bot speak more, only changes what it says when it
+            # already decided to.
+            if event.source == "speech":
+                reasons.append("curiosity")
+
+        # Promotion pressure: a relevance-gated nudge (already weight-scaled by the
+        # planner) that makes the bot readier to speak *only* when a plug is apt to
+        # the current moment. It never fires on its own — it just tips an
+        # already-plausible reply — and the planner's caps keep it from dominating.
+        if promo_salience > 0.0:
+            score += promo_salience
+            reasons.append("promo")
 
         # Hard rate-limit floor: never post faster than this, regardless of score.
         if seconds_since_own_message < self.min_seconds_between_posts:
@@ -190,6 +218,19 @@ class SimpleArbiter:
     def _looks_like_question(text: str) -> bool:
         lowered = text.lower().strip()
         return lowered.endswith("?") or lowered.startswith(QUESTION_PREFIXES)
+
+    @staticmethod
+    def _worth_engaging(event: Event, text: str) -> bool:
+        """Whether a viewer's chat line is substantive enough to banter with.
+
+        Guards against butting into one-word spam or emote pile-ons (the trend
+        mirror's job) — those are short. A real sentence from a viewer is the
+        thing the bot should be able to reply to directly.
+        """
+        if event.source != "chat" or event.kind != "message":
+            return False
+        stripped = text.strip()
+        return len(stripped) >= 8 and len(stripped.split()) >= 3
 
     @staticmethod
     def _has_hype(text: str) -> bool:

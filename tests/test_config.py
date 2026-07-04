@@ -41,4 +41,4 @@ def test_audio_gate_thresholds_are_bounded():
 
 def test_vlm_thresholds_are_validated():
     with pytest.raises(ValidationError):
-        Settings.model_validate({"models": {"vlm": {"brightness_change_threshold": 1.5}}})
+        Settings.model_validate({"models": {"vlm": {"frame_diff_threshold": 1.5}}})

@@ -25,6 +25,7 @@ POSITIVE_REASONS = frozenset(
         "scene_event",
         "streamer_mishap",
         "lull",
+        "promo",
     }
 )
 BLOCKING_REASONS = frozenset({"rate_limited", "stale_trigger"})
@@ -59,6 +60,7 @@ class TickReport:
     scene_summary: str = ""
     posted: str | None = None  # message posted this tick, if any
     dropped: str | None = None  # message generated then dropped (stale/dup), if any
+    condition: str = ""  # experiment-arm label when the post went out under a plug
 
 
 @runtime_checkable

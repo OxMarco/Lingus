@@ -28,6 +28,14 @@ yt-dlp>=2026.6.9
 faster-whisper>=1.2.1
 numpy>=1.26
 
+# --- transformers cap (constraint, not a direct runtime dep here) ---
+# mlx-lm 0.31.x (pulled in by the [video-mlx] extra, and used by the audio-ml
+# gate) calls AutoTokenizer.register("NewlineTokenizer", ...) which transformers
+# 5.13 rejects ('str' object has no attribute '__module__'), crashing `import
+# mlx_vlm`. That surfaces as a misleading "no Metal device" error from the VLM
+# backend. Cap below the breaking release so installs stay reproducible.
+transformers>=4.44,<5.13
+
 # Optional heavier Hugging Face AudioSet gate:
 #   pip install -e ".[audio-ml]"
 #   then set models.audio_gate.backend: hf_ast

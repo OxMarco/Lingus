@@ -82,8 +82,8 @@ system. The hard problems are about *timing*, not any single perception module:
   **"What do I say?"** (an expensive *generator* that only runs when the arbiter fires).
 * **Personality** is distributed across three subsystems — arbiter *timing*,
   generator *voice*, and memory *callbacks* — not just the prompt.
-* Every generated message passes a deterministic **safety filter** and **output
-  governor** (rate + length caps) before it is posted.
+* Every message passes a deterministic **output governor** (rate + length caps)
+  before it is posted.
 
 <p align="right">(<a href="#readme-top">back to top</a>)</p>
 
@@ -114,7 +114,7 @@ flowchart LR
 
 * **Adapters** (`adapters/`) abstract the platform: file-replay + YouTube (Twitch later).
 * **Model backends** (`models/`) abstract the models: small ones local (ASR, VLM),
-  the generator hosted (OpenAI-compatible — GPT-5.5 / Grok).
+  the generator hosted (OpenAI-compatible — GPT / Grok).
 * **Memory** (`memory/`) spans four layers: working buffer, episodic summarization,
   durable episodic summaries, durable semantic facts (cross-stream), and
   self-memory + dedup.
@@ -196,7 +196,7 @@ bot's reply through the file replay chat adapter.
 ### Run against a live YouTube stream
 
 Lingus runs in **observe mode** here: it pulls the stream's **audio** (→ ASR) and
-**live chat** (keyless), runs the full arbiter → generator → safety → governor
+**live chat** (keyless), runs the full arbiter → generator → governor
 pipeline, and **logs the reply it *would* post** — it does not write to chat.
 (Posting needs OAuth and lands with the posting/Twitch adapter; `ObserveChatAdapter`
 is read-only by design.)
@@ -212,9 +212,8 @@ is read-only by design.)
    OPENAI_API_KEY=sk-...
    OPENAI_BASE_URL=            # blank for OpenAI; https://api.x.ai/v1 for Grok; etc.
    ```
-   Match `models.llm.model` in `config.yaml` to your provider. The safety gate
-   (`moderation.backend: regex`) and live-chat ingestion (`youtube.chat_enabled: true`)
-   are on by default — leave them on.
+   Match `models.llm.model` in `config.yaml` to your provider. Live-chat ingestion
+   (`youtube.chat_enabled: true`) is on by default — leave it on.
 3. Point it at a **currently-live** stream (URL or video ID):
    ```sh
    python -m lingus.app --platform youtube --video "https://www.youtube.com/watch?v=<LIVE_ID>"
@@ -224,7 +223,7 @@ Useful flags: `--language it|en|auto` (pin ASR language; default `en`),
 `--asr-model small|medium|large-v3|turbo` (this checkout targets `turbo`;
 uncached models download on first use),
 `--research` / `--no-research` (force or skip cold-start channel profiling),
-`--vlm-backend mlx_vlm|local_cv|none` and `--vlm-model <mlx-model>` (local
+`--vlm-backend mlx_vlm|none` and `--vlm-model <mlx-model>` (local
 Phase-4 video scene state), `--dashboard` or `--web --web-port 8080` (live view
 of world-state, arbiter scores, and would-be posts).
 
@@ -258,16 +257,16 @@ ruff check src tests
 
 - [x] **Phase 0** — skeleton: config, world-state, persona schema, adapter/model ABCs, offline loop
 - [x] **Phase 0.5** — context snapshot, simple arbiter, deterministic offline reply loop
-- [ ] **Phase 1** — speech → reply → chat: capture + local ASR + hosted/template generator + governor wired and validated live in observe mode
-    - Remaining: validate the real LLM generator live; post path lands with the Twitch adapter
+- [x] **Phase 1** — speech → reply → chat: capture + local ASR + hosted/template generator + governor wired and validated live in observe mode
 - [x] **Phase 2** — chat perception: `ChatTrendDetector` (hype/pile-on) built and wired into the arbiter; keyless YouTube live-chat ingestion (`YouTubeLiveChatClient`) wired into `ObserveChatAdapter`
 - [x] **Phase 3** — memory: working + self-memory + dedup/bit-fatigue + episodic summarization + semantic (durable cross-stream facts)
 - [x] **Phase 3.5** — memory hardening: durable per-stream episodic summaries (`.lingus/episodes.json`) surface prior stream context without adding a vector/RAG database yet
-- [ ] **Phase 4** — video: YouTube RGB frame capture + deterministic frame gate + local MLX-VLM (`Qwen2.5-VL-3B-Instruct-4bit`) scene-state backend wired, with `local_cv` fallback; remaining: live latency tuning and richer OpenCV/PySceneDetect gating
-- [x] **Phase 5** — lean hardening: pre-ASR speech/music audio gate; output moderation pass (`RegexModeration`, authoritative gate in the post path); output governor (rate + length caps). Keep latency-heavy guard models and barge-in machinery out of the hot path unless real evals prove they are needed.
+- [x] **Phase 4** — video: YouTube RGB frame capture + deterministic frame gate + local MLX-VLM (`Qwen2.5-VL-3B-Instruct-4bit`) scene-state backend wired and feeding change-reported scene state into the world state (no colour-only fallback — a broken VLM terminates the run); live latency tuning and richer OpenCV/PySceneDetect gating deferred to Phase 8
+- [x] **Phase 5** — lean hardening: pre-ASR speech/music audio gate; output governor (rate + length caps). Keep latency-heavy guard models and barge-in machinery out of the hot path unless real evals prove they are needed.
 - [x] **Phase 6** — eval loop: record / replay / judge (`--eval`, local heuristic judge)
 - [x] **Cold-start research** — profile the channel pre-loop and seed durable memory (`research/`, per-channel cache)
-- [ ] **Final** — Twitch adapter
+- [ ] **Phase 7** — platform write path: add Twitch and Kick posting adapters (the only posting path today is observe/read-only — `ObserveChatAdapter` logs the reply it *would* post)
+- [ ] **Phase 8** — live validation & regression testing (deferred out of the build phases): validate the real hosted LLM generator live; validate keyless YouTube live-chat ingestion across more streams; video live-latency tuning + install/download validation + richer OpenCV/PySceneDetect gating; curate an eval regression segment library and wire it into an automated arbiter-weight tuning sweep
 
 See the [open issues](https://github.com/OxMarco/Lingus/issues) for a full list of
 proposed features (and known issues).

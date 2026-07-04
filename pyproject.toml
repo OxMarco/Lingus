@@ -20,7 +20,11 @@ dependencies = [
 # Phase 1: speech -> reply -> chat
 asr = ["faster-whisper>=1.0", "numpy>=1.26"]  # ASR + lightweight spectral audio gate
 audio-ml = [
-    "transformers>=4.44",
+    # <5.13: transformers 5.13 changed AutoTokenizer.register() and breaks
+    # mlx-lm 0.31.x's tokenizer registration (crashes `import mlx_vlm`, which the
+    # VLM backend then mis-reports as a missing Metal device). Keep the cap in
+    # sync with the [video-mlx] extra below.
+    "transformers>=4.44,<5.13",
     "torch>=2.2",
     "librosa>=0.10",
 ]  # optional Hugging Face AudioSet speech/music gate
@@ -40,15 +44,22 @@ web = ["aiohttp>=3.9"]  # live web tuner UI sidecar (lingus --web)
 # Phase 4: video
 video = ["opencv-python>=4.9", "scenedetect>=0.6", "ImageHash>=4.3"]
 # Local Apple Silicon VLM for Phase 4 scene state (no hosted vision calls).
-video-mlx = ["mlx-vlm>=0.1.0"]
+# The transformers cap is required, not incidental: mlx-vlm depends on mlx-lm,
+# whose 0.31.x tokenizer registration crashes on transformers 5.13 (surfaces as
+# a bogus "no Metal device" error). Keep in sync with the audio-ml cap above.
+video-mlx = ["mlx-vlm>=0.1.0", "transformers>=4.44,<5.13"]
 # Local speech/audio embeddings for richer speech tagging.
 speech-tags = ["sherpa-onnx>=1.10"]
 # Phase 3: semantic memory
 memory = ["chromadb>=0.5"]
 # Cold-start channel research: live web search for the channel profiler
 research = ["ddgs>=6.0"]
-# Twitch (final phase)
-twitch = ["streamlink>=6.0", "twitchio>=2.8"]
+# Twitch: streamlink resolves the live HLS URL (A/V); twitchio handles chat.
+# Pinned to twitchio 2.x: the adapter targets its stable IRC-based API
+# (commands.Bot / event_message / channel.send). twitchio 3.x is a rewrite
+# around EventSub that needs a registered app + token store — a later migration,
+# isolated behind the TwitchChatAdapter ABC when we want it.
+twitch = ["streamlink>=6.0", "twitchio>=2.8,<3"]
 
 dev = [
     "pytest>=8.0",

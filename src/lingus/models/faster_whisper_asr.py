@@ -39,7 +39,6 @@ _BYTES_PER_SAMPLE = 2  # int16 PCM
 # logprob/no-speech check alone won't catch them. The subtitle-credit family is
 # the usual offender across languages; a few stock "outro" lines round it out.
 _HALLUCINATION_MARKERS = (
-    "sottotitoli",  # "Sottotitoli a cura di QTSS" (Italian, seen live)
     "qtss",
     "amara.org",
     "sous-titres",  # French
@@ -199,7 +198,7 @@ class FasterWhisperASR(ASRBackend):
             audio_seconds,
             rtf,
         )
-        # Drop hallucinated segments (the "Sottotitoli a cura di…" family Whisper
+        # Drop hallucinated segments (family Whisper
         # emits on music/near-silence). Keeps the bot from reacting to phantom
         # speech (CLAUDE.md §9).
         kept = [

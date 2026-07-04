@@ -379,7 +379,7 @@ State of the implementation against the Phase plan in §8. 264 tests pass, ruff 
     64 GB machine; `medium` remains a safe fallback. **VAD-based
     utterance segmentation** (Silero, bundled) with amortization so each Whisper
     call clears the ~4s break-even; cuts on pauses, not mid-word. Hallucination
-    filter (confidence + denylist) for the "Sottotitoli a cura di…" family.
+    filter (confidence + denylist) for the family.
     Pre-ASR audio gate (`models.audio_gate`) drops silence/music-like windows
     before Whisper, replacing them with short silence so music/lyrics don't
     poison transcript context; schema/default config is lightweight `spectral`.

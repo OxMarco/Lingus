@@ -21,7 +21,7 @@
   <h3 align="center">Lingus</h3>
 
   <p align="center">
-    🎥🎙️💬 &nbsp;A live-stream bot that watches the video, listens to the audio, reads the chat, and picks its moments to say something in character.
+    A live-stream bot that watches the video, listens to the audio, reads the chat, and picks its moments to say something in character.
     <br />
     <strong>Built for personality, not coverage.</strong>
     <br />
@@ -41,7 +41,7 @@
 
 <!-- TABLE OF CONTENTS -->
 <details>
-  <summary>📖 &nbsp;Table of Contents</summary>
+  <summary>Table of Contents</summary>
   <ol>
     <li><a href="#-about-the-project">About The Project</a></li>
     <li><a href="#-features">Features</a></li>
@@ -72,7 +72,7 @@
 
 
 <!-- ABOUT THE PROJECT -->
-## 🧠 About The Project
+## About The Project
 
 **Lingus** follows a live stream on three channels at once: video, audio, and chat. It
 stitches them into one picture of what's happening right now, works out whether that
@@ -87,60 +87,60 @@ about any one perception module. A few decisions shape everything else:
 
 | Principle | What it means |
 |---|---|
-| 🕰️ **Runs on a clock** | The bot ticks on its own schedule and chooses when to react. Nobody prompts it. |
-| 📋 **Shared blackboard** | Perception writes a timestamped world-state. Cognition reads that state and never touches the raw streams. |
-| 🎯 **Two separate questions** | "Should I speak?" is a cheap arbiter that runs constantly. "What do I say?" is an expensive generator that only runs when the arbiter says yes. |
-| 🎭 **Personality is spread out** | Character comes from arbiter timing, generator voice, and memory callbacks. It isn't just a prompt. |
-| 🛑 **A hard last step** | Every message goes through an output governor for rate and length before it posts. No model decision can skip it. |
+| **Runs on a clock** | The bot ticks on its own schedule and chooses when to react. Nobody prompts it. |
+| **Shared blackboard** | Perception writes a timestamped world-state. Cognition reads that state and never touches the raw streams. |
+| **Two separate questions** | "Should I speak?" is a cheap arbiter that runs constantly. "What do I say?" is an expensive generator that only runs when the arbiter says yes. |
+| **Personality is spread out** | Character comes from arbiter timing, generator voice, and memory callbacks. It isn't just a prompt. |
+| **A hard last step** | Every message goes through an output governor for rate and length before it posts. No model decision can skip it. |
 
 <p align="right">(<a href="#readme-top">back to top</a>)</p>
 
 
 
-## ✨ Features
+## Features
 
 <table>
 <tr>
 <td width="50%" valign="top">
 
-### 👁️ Perception
-- 🎙️ **Streaming ASR.** Local faster-whisper with Silero VAD, so it cuts on pauses instead of chopping words in half.
-- 🔇 **Pre-ASR audio gate.** Drops silence and music windows before they reach Whisper, so song lyrics don't leak into the transcript.
-- 🚫 **Hallucination filter.** Throws out Whisper's phantom phrases on music and silence.
-- 🎞️ **Video scene-state.** RGB frame-diff gating feeds a local MLX-VLM (Qwen2.5-VL) that reports what changed on screen, not a caption per frame.
-- 💬 **Chat aggregation.** The firehose gets boiled down to questions aimed at the bot, hype and pile-on spikes, and topics as they emerge.
+### Perception
+- **Streaming ASR.** Local faster-whisper with Silero VAD, so it cuts on pauses instead of chopping words in half.
+- **Pre-ASR audio gate.** Drops silence and music windows before they reach Whisper, so song lyrics don't leak into the transcript.
+- **Hallucination filter.** Throws out Whisper's phantom phrases on music and silence.
+- **Video scene-state.** RGB frame-diff gating feeds a local MLX-VLM (Qwen2.5-VL) that reports what changed on screen, not a caption per frame.
+- **Chat aggregation.** The firehose gets boiled down to questions aimed at the bot, hype and pile-on spikes, and topics as they emerge.
 
 </td>
 <td width="50%" valign="top">
 
-### 🧩 Cognition
-- ⚖️ **Heuristic arbiter.** Scores salience from direct mentions, questions, hype, scene events, and lulls, with a cooldown that climbs each time it speaks.
-- 🖋️ **Persona generator.** A structured persona spec, an exemplar bank, and the relevant memory go in; a short in-character line comes out.
-- 🎚️ **Bounded mood.** A slowly decaying energy value that nudges the arbiter's thresholds and the generator's phrasing.
-- 🧍 **Humanizer.** Strips the machine-written tells (em dashes, smart quotes, single-glyph ellipses) and can add human-shaped typos.
-- 📣 **In-character plugs.** Product mentions that only surface when the live context already fits, spaced out so they can't take over.
+### Cognition
+- **Heuristic arbiter.** Scores salience from direct mentions, questions, hype, scene events, and lulls, with a cooldown that climbs each time it speaks.
+- **Persona generator.** A structured persona spec, an exemplar bank, and the relevant memory go in; a short in-character line comes out.
+- **Bounded mood.** A slowly decaying energy value that nudges the arbiter's thresholds and the generator's phrasing.
+- **Humanizer.** Strips the machine-written tells (em dashes, smart quotes, single-glyph ellipses) and can add human-shaped typos.
+- **In-character plugs.** Product mentions that only surface when the live context already fits, spaced out so they can't take over.
 
 </td>
 </tr>
 <tr>
 <td width="50%" valign="top">
 
-### 🧠 Memory
-- 🪟 **Working buffer.** The last few minutes of transcript, scene, and chat, fed straight into context.
-- 📚 **Episodic summaries.** Old transcript gets folded into a running "stream so far" so long streams don't blow the context window.
-- 💾 **Cross-stream memory.** Per-stream summaries and durable facts are saved and reloaded, scoped per channel so one stream's notes don't bleed into another's.
-- 🔁 **Self-memory and dedup.** Tracks its own recent lines and joke fatigue so it doesn't repeat itself.
-- 🔎 **Cold-start research.** Profiles the channel before the loop starts and seeds memory, so it walks in already knowing the place.
+### Memory
+- **Working buffer.** The last few minutes of transcript, scene, and chat, fed straight into context.
+- **Episodic summaries.** Old transcript gets folded into a running "stream so far" so long streams don't blow the context window.
+- **Cross-stream memory.** Per-stream summaries and durable facts are saved and reloaded, scoped per channel so one stream's notes don't bleed into another's.
+- **Self-memory and dedup.** Tracks its own recent lines and joke fatigue so it doesn't repeat itself.
+- **Cold-start research.** Profiles the channel before the loop starts and seeds memory, so it walks in already knowing the place.
 
 </td>
 <td width="50%" valign="top">
 
-### 🛡️ Output & Tooling
-- 🚦 **Output governor.** Token-bucket rate limit, a hard minimum gap between posts, and a sentence-aware length cap. It drops stale replies rather than queueing them.
-- 📊 **Live dashboards.** A Rich terminal view and a browser tuner, both fed off the same tick stream, so you can watch the salience bar move.
-- 🎛️ **Live tuning.** Change how chatty it is, flip posting on or off, or tweak raw params from the browser. It lands on the next tick, no restart.
-- 🧪 **Eval harness.** Replays recorded segments through the real loop and scores each line on staying in character, not sounding generic, and not repeating.
-- 🔌 **Adapter seams.** File-replay, YouTube (keyless chat), and Twitch (write path) all sit behind clean interfaces.
+### Output & Tooling
+- **Output governor.** Token-bucket rate limit, a hard minimum gap between posts, and a sentence-aware length cap. It drops stale replies rather than queueing them.
+- **Live dashboards.** A Rich terminal view and a browser tuner, both fed off the same tick stream, so you can watch the salience bar move.
+- **Live tuning.** Change how chatty it is, flip posting on or off, or tweak raw params from the browser. It lands on the next tick, no restart.
+- **Eval harness.** Replays recorded segments through the real loop and scores each line on staying in character, not sounding generic, and not repeating.
+- **Adapter seams.** File-replay, YouTube (keyless chat), and Twitch (write path) all sit behind clean interfaces.
 
 </td>
 </tr>
@@ -150,7 +150,7 @@ about any one perception module. A few decisions shape everything else:
 
 
 
-## 🏗️ Architecture
+## Architecture
 
 Perception modules run at very different rates, so they all write into one timestamped
 blackboard instead of talking to each other. Cognition reads a snapshot of that board
@@ -159,25 +159,25 @@ and the model always gets one clean, time-aligned view.
 
 ```mermaid
 flowchart LR
-    subgraph P[" 👁️ PERCEPTION "]
+    subgraph P[" PERCEPTION "]
         direction TB
-        VIDEO["🎞️ Video<br/>scene events"]
-        AUDIO["🎙️ Audio<br/>speech + sound"]
-        CHATIN["💬 Chat<br/>questions + hype"]
+        VIDEO["Video<br/>scene events"]
+        AUDIO["Audio<br/>speech + sound"]
+        CHATIN["Chat<br/>questions + hype"]
     end
 
-    WS["📋 <b>WORLD STATE</b><br/>timestamped blackboard"]
+    WS["<b>WORLD STATE</b><br/>timestamped blackboard"]
 
-    subgraph C[" 🧩 COGNITION "]
+    subgraph C[" COGNITION "]
         direction TB
-        ARB{"⚖️ <b>ARBITER</b><br/>should I speak?"}
-        GEN["🖋️ <b>GENERATOR</b><br/>what do I say?"]
-        HUM["🧍 Humanizer"]
-        GOV["🚦 Output Governor<br/>rate + length"]
+        ARB{"<b>ARBITER</b><br/>should I speak?"}
+        GEN["<b>GENERATOR</b><br/>what do I say?"]
+        HUM["Humanizer"]
+        GOV["Output Governor<br/>rate + length"]
     end
 
-    MEM["🧠 <b>MEMORY</b><br/>working · episodic<br/>semantic · self"]
-    POST["📤 Post to<br/>stream chat"]
+    MEM["<b>MEMORY</b><br/>working · episodic<br/>semantic · self"]
+    POST["Post to<br/>stream chat"]
 
     VIDEO --> WS
     AUDIO --> WS
@@ -210,26 +210,26 @@ flowchart LR
 ```mermaid
 sequenceDiagram
     autonumber
-    participant WS as 📋 World State
-    participant ARB as ⚖️ Arbiter
-    participant MEM as 🧠 Memory
-    participant GEN as 🖋️ Generator
-    participant GOV as 🚦 Governor
-    participant CHAT as 📤 Chat
+    participant WS as World State
+    participant ARB as Arbiter
+    participant MEM as Memory
+    participant GEN as Generator
+    participant GOV as Governor
+    participant CHAT as Chat
 
     loop every tick (on a clock)
         WS->>ARB: context snapshot
         alt salience < threshold
-            ARB-->>WS: stay quiet 🤐
+            ARB-->>WS: stay quiet
         else salience ≥ threshold
             ARB->>MEM: fetch relevant memory
             MEM-->>GEN: facts · stream-so-far · self-memory
             GEN->>GOV: candidate reply
             alt rate/length OK & not stale
-                GOV->>CHAT: post ✅
+                GOV->>CHAT: post
                 CHAT-->>WS: re-inject own message
             else dropped
-                GOV-->>WS: drop (stale / rate-limited) 🚫
+                GOV-->>WS: drop (stale / rate-limited)
             end
         end
     end
@@ -242,43 +242,43 @@ semantic layer:
 
 | Layer | What it holds | How it's built |
 |---|---|---|
-| 🪟 **Working** | last few minutes of transcript, scene states, chat highlights | rolling buffer on `WorldState`, fed straight into context |
-| 📚 **Episodic** | the "stream so far" plus past-stream summaries | old working memory gets summarized into `.lingus/episodes.json` |
-| 💾 **Semantic** | durable facts: the streamer, regulars, running bits | hand-rolled token-overlap retrieval in `.lingus/semantic.json`, loaded across streams |
-| 🔁 **Self-memory** | the bot's own recent lines | fed back in, with dedup and joke-fatigue tracking |
+| **Working** | last few minutes of transcript, scene states, chat highlights | rolling buffer on `WorldState`, fed straight into context |
+| **Episodic** | the "stream so far" plus past-stream summaries | old working memory gets summarized into `.lingus/episodes.json` |
+| **Semantic** | durable facts: the streamer, regulars, running bits | hand-rolled token-overlap retrieval in `.lingus/semantic.json`, loaded across streams |
+| **Self-memory** | the bot's own recent lines | fed back in, with dedup and joke-fatigue tracking |
 
 <p align="right">(<a href="#readme-top">back to top</a>)</p>
 
 
 
-## 🔧 Built With
+## Built With
 
 [![Python][python-shield]][python-url]
 
 | | |
 |---|---|
-| 🎙️ **ASR** | [faster-whisper](https://github.com/SYSTRAN/faster-whisper), streaming, VAD-segmented |
-| 🎥 **Capture** | [yt-dlp](https://github.com/yt-dlp/yt-dlp), [PyAV](https://github.com/PyAV-Org/PyAV), FFmpeg |
-| 👁️ **Vision** | [MLX-VLM](https://github.com/Blaizzy/mlx-vlm) running Qwen2.5-VL locally on Apple Silicon |
-| 🤖 **Generator** | [OpenAI-compatible client](https://github.com/openai/openai-python) with [Instructor](https://github.com/567-labs/instructor) for structured output |
-| 💬 **Chat** | keyless YouTube InnerTube, [TwitchIO](https://github.com/PythonistaGuild/TwitchIO), [Streamlink](https://github.com/streamlink/streamlink) |
-| 🧱 **Core** | [Pydantic](https://docs.pydantic.dev/) schemas, [Tenacity](https://tenacity.readthedocs.io/) for retries |
-| 📊 **Dashboards** | [Rich](https://github.com/Textualize/rich) terminal, [aiohttp](https://docs.aiohttp.org/) web sidecar |
+| **ASR** | [faster-whisper](https://github.com/SYSTRAN/faster-whisper), streaming, VAD-segmented |
+| **Capture** | [yt-dlp](https://github.com/yt-dlp/yt-dlp), [PyAV](https://github.com/PyAV-Org/PyAV), FFmpeg |
+| **Vision** | [MLX-VLM](https://github.com/Blaizzy/mlx-vlm) running Qwen2.5-VL locally on Apple Silicon |
+| **Generator** | [OpenAI-compatible client](https://github.com/openai/openai-python) with [Instructor](https://github.com/567-labs/instructor) for structured output |
+| **Chat** | keyless YouTube InnerTube, [TwitchIO](https://github.com/PythonistaGuild/TwitchIO), [Streamlink](https://github.com/streamlink/streamlink) |
+| **Core** | [Pydantic](https://docs.pydantic.dev/) schemas, [Tenacity](https://tenacity.readthedocs.io/) for retries |
+| **Dashboards** | [Rich](https://github.com/Textualize/rich) terminal, [aiohttp](https://docs.aiohttp.org/) web sidecar |
 
 <p align="right">(<a href="#readme-top">back to top</a>)</p>
 
 
 
 <!-- GETTING STARTED -->
-## 🚀 Getting Started
+## Getting Started
 
 Here's how to get a copy running locally.
 
 ### Prerequisites
 
-* 🐍 **Python 3.12 or 3.13.** The live ASR stack has no 3.14 wheels yet.
-* 📦 **A virtualenv.** Phase 0 runs on the core install alone; the heavy stuff is optional extras.
-* 🍎 **Apple Silicon** if you want local video (MLX-VLM needs Metal). Optional otherwise.
+* **Python 3.12 or 3.13.** The live ASR stack has no 3.14 wheels yet.
+* **A virtualenv.** Phase 0 runs on the core install alone; the heavy stuff is optional extras.
+* **Apple Silicon** if you want local video (MLX-VLM needs Metal). Optional otherwise.
 
 ### Installation
 
@@ -324,9 +324,9 @@ Here's how to get a copy running locally.
 
 
 <!-- USAGE EXAMPLES -->
-## 🎬 Usage
+## Usage
 
-### ▶️ Offline replay, no network or keys
+### Offline replay, no network or keys
 
 ```sh
 python -m lingus.app --segment tests/samples/demo
@@ -342,7 +342,7 @@ python -m lingus.app --segment tests/samples/cake --speed 100
 This one replays the scene and speech around a chocolate-cake stain and logs the bot's
 reply through the file-replay chat adapter.
 
-### 📺 Live YouTube stream (observe mode)
+### Live YouTube stream (observe mode)
 
 In observe mode the bot pulls the stream's audio (into ASR) and its live chat (keyless),
 runs the full arbiter → generator → humanizer → governor path, and logs the reply it
@@ -368,7 +368,7 @@ posting adapters; `ObserveChatAdapter` is read-only on purpose.
    ```
 
 <details>
-<summary>⚙️ &nbsp;Handy flags</summary>
+<summary>Handy flags</summary>
 
 | Flag | Effect |
 |---|---|
@@ -395,7 +395,7 @@ config uses the lightweight `spectral` gate; install `".[audio-ml]"` if you want
 > VLM can't load, the run stops instead of quietly degrading. Set
 > `models.vlm.backend=none` to run without video where Metal isn't available.
 
-### ✅ Tests and linter
+### Tests and linter
 
 ```sh
 pytest                    # 267 tests
@@ -407,7 +407,7 @@ ruff check src tests      # clean
 
 
 <!-- ROADMAP -->
-## 🗺️ Roadmap
+## Roadmap
 
 - [x] **Phase 0**: skeleton: config, world-state, persona schema, adapter/model interfaces, offline loop
 - [x] **Phase 0.5**: context snapshot, simple arbiter, deterministic offline reply loop
@@ -430,23 +430,23 @@ proposed features and known bugs.
 
 
 <!-- CONTRIBUTING -->
-## 🤝 Contributing
+## Contributing
 
 Contributions are welcome. If you've got an idea that would make this better, fork the
 repo and open a pull request, or just open an issue with the `enhancement` tag.
 
-1. 🍴 Fork the project
-2. 🌿 Create a feature branch (`git checkout -b feature/AmazingFeature`)
-3. 💾 Commit your changes (`git commit -m 'Add some AmazingFeature'`)
-4. 🚀 Push the branch (`git push origin feature/AmazingFeature`)
-5. 🔀 Open a pull request
+1. Fork the project
+2. Create a feature branch (`git checkout -b feature/AmazingFeature`)
+3. Commit your changes (`git commit -m 'Add some AmazingFeature'`)
+4. Push the branch (`git push origin feature/AmazingFeature`)
+5. Open a pull request
 
 <p align="right">(<a href="#readme-top">back to top</a>)</p>
 
 
 
 <!-- LICENSE -->
-## 📄 License
+## License
 
 Distributed under the project license. See `LICENSE` for details.
 
@@ -455,7 +455,7 @@ Distributed under the project license. See `LICENSE` for details.
 
 
 <!-- CONTACT -->
-## 📬 Contact
+## Contact
 
 OxMarco, [@OxMarco](https://github.com/OxMarco)
 
@@ -466,7 +466,7 @@ Project link: [https://github.com/OxMarco/Lingus](https://github.com/OxMarco/Lin
 
 
 <!-- ACKNOWLEDGMENTS -->
-## 🙏 Acknowledgments
+## Acknowledgments
 
 * [Best-README-Template](https://github.com/othneildrew/Best-README-Template)
 * [SillyTavern character cards and lorebooks](https://github.com/SillyTavern/SillyTavern), the persona design reference
